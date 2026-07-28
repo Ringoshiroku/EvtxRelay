@@ -65,6 +65,7 @@ if (-not (Test-Path -LiteralPath $ConfigDir)) {
     New-Item -Path $ConfigDir -ItemType Directory -Force | Out-Null
 }
 $LogPath = Join-Path $ConfigDir 'evtxrelay.log'
+$ElkHostPlaceholder = '<ISI_IP_ATAU_HOSTNAME_ELK_DI_SINI>'
 if (-not $IndexName) { $IndexName = "$Tool-events" }
 
 
@@ -92,32 +93,47 @@ function Write-EvtxRelayLog {
 # SETTINGS AND SAVED LOGIN
 
 
-# loads the saved elk host, asks for it if there is not one yet, and saves
-# whatever answer it gets
+# creates a blank settings file for the user to fill in on first run
+function New-EvtxRelayConfigTemplate {
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$Placeholder,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    $template = [PSCustomObject]@{
+        ElkHost = $Placeholder
+    }
+    $template | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath
+    Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Edit 'ElkHost' before running again."
+}
+
+# loads the saved settings file, mixes in any value passed on the command
+# line, and makes sure an elk host is actually set before continuing
 function Get-EvtxRelayConfig {
     param(
         [Parameter(Mandatory)][string]$ConfigDir,
         [string]$ElkHostOverride,
-        [Parameter(Mandatory)][string]$LogPath
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$ElkHostPlaceholder
     )
     $configPath = Join-Path $ConfigDir 'config.json'
-    $cached = $null
-    if (Test-Path -LiteralPath $configPath) {
-        try {
-            $cached = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-        }
-        catch {
-            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Cached config at '$configPath' is corrupt or unreadable ($($_.Exception.Message)); ignoring it and re-prompting."
-            $cached = $null
-        }
+
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        New-EvtxRelayConfigTemplate -ConfigPath $configPath -Placeholder $ElkHostPlaceholder -LogPath $LogPath
+        throw "config.json did not exist, so a template was created at '$configPath'. Fill in 'ElkHost', then run again."
     }
 
-    $elkHostValue = if ($ElkHostOverride) { $ElkHostOverride }
-    elseif ($cached -and $cached.ElkHost) { $cached.ElkHost }
-    else { Read-Host -Prompt 'Elasticsearch/Kibana host (VPS or LAN address)' }
+    try {
+        $cached = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Cached config at '$configPath' is corrupt or unreadable ($($_.Exception.Message)). Fix or delete the file, then run again; it will not be overwritten automatically."
+    }
 
-    if ([string]::IsNullOrWhiteSpace($elkHostValue)) {
-        throw "No ELK host was provided (cached config is missing 'ElkHost' and nothing was entered at the prompt). Pass -ElkHost explicitly, or re-run and enter a value when asked."
+    $elkHostValue = if ($ElkHostOverride) { $ElkHostOverride } elseif ($cached.ElkHost) { $cached.ElkHost } else { $null }
+
+    if ([string]::IsNullOrWhiteSpace($elkHostValue) -or $elkHostValue -eq $ElkHostPlaceholder) {
+        throw "No ELK host is set. Pass -ElkHost explicitly, or edit 'ElkHost' in '$configPath' (it's currently unset or still the placeholder value)."
     }
 
     $configObject = [PSCustomObject]@{
@@ -270,7 +286,7 @@ function ConvertTo-BulkBody {
 Write-EvtxRelayLog -LogPath $LogPath -Message "=== EvtxRelay start: File='$File' Tool='$Tool' ==="
 
 try {
-    $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -LogPath $LogPath
+    $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
     $cred = Get-EvtxRelayCredential -ConfigDir $ConfigDir -Reset:$ResetCredential -LogPath $LogPath
 
     $pair = "$($cred.UserName):$($cred.GetNetworkCredential().Password)"
