@@ -68,8 +68,13 @@ instead of one CSV like the other three tools. Point `-Folder` at that
 folder instead of using `-File`, and EvtxRelay uploads every `.csv` it
 finds there in one run, each into its own index named
 `apt-hunter-<category>` (for example `apt-hunter-logon_events`,
-`apt-hunter-timesketch`). The category name comes from each file's own
-name, so it follows whatever you named the APT-Hunter run.
+`apt-hunter-timesketch`). All the CSVs in an APT-Hunter output folder share
+a common filename prefix (whatever run name you gave APT-Hunter when you
+ran it), and EvtxRelay strips that shared prefix off each filename to get
+the category, so the category is independent of whatever you named the
+run. If `-Folder` only has one CSV in it, there's no other file to compare
+against to find that shared prefix, so the whole filename (run name
+included) is used as the category as-is.
 
 A couple of files get skipped automatically rather than uploaded, and this
 is normal, not an error:

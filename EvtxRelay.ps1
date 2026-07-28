@@ -1,17 +1,21 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    takes a csv file (from hayabusa, chainsaw, or evtxecmd) and loads it into
-    elasticsearch, then makes sure kibana has a matching data view and saved
-    search ready to open.
+    takes a csv file (from hayabusa, chainsaw, evtxecmd, or apt-hunter) and
+    loads it into elasticsearch, then makes sure kibana has a matching data
+    view and saved search ready to open.
 
 .DESCRIPTION
-    reads a csv made by one of the three tools, cleans up its column names
+    reads a csv made by one of the four tools, cleans up its column names
     (removes the hidden byte at the start of the file, swaps dots for
     underscores), uploads every row in batches, double checks that no column
     got dropped along the way, and sets up a kibana data view and saved
     search if they don't already exist. running it again on the same file is
     safe and won't create duplicates.
+
+    apt-hunter is different: it writes a whole folder of csv files instead of
+    one, so use -Folder with -Tool apt-hunter instead of -File, and every csv
+    in the folder gets uploaded into its own index in one run.
 
     kibana changed how data views are managed between versions, so this
     script tries the newer way first and automatically falls back to the
@@ -673,9 +677,18 @@ function Resolve-EvtxRelayTimestampField {
         [string]$Override
     )
     if ($Override) { return $Override }
+    # check for an exact-case match first, in priority order, before falling back to a
+    # case-insensitive one. otherwise a lower-priority candidate that only matches by case
+    # (like 'DateTime' matching a real column named 'datetime') could win over the real
+    # match further down the list, and we'd return a field name that doesn't actually exist.
     foreach ($candidate in $Candidates) {
-        if ($SanitizedFields -contains $candidate) {
-            return $candidate
+        foreach ($field in $SanitizedFields) {
+            if ($field -ceq $candidate) { return $field }
+        }
+    }
+    foreach ($candidate in $Candidates) {
+        foreach ($field in $SanitizedFields) {
+            if ($field -eq $candidate) { return $field }
         }
     }
     return $null
@@ -924,6 +937,7 @@ try {
                 $originalHeaders = @($records[0].PSObject.Properties.Name)
                 $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
                 $sanitizedFields = @($headerMap.Values)
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
 
                 $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
                     -Candidates $TimestampCandidates[$Tool] -Override $null
