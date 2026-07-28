@@ -26,6 +26,7 @@ param(
     [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd')]
     [string]$Tool,
 
+    [string]$IndexName,
     [string]$ElkHost,
     [int]$ElasticPort = 9200,
     [int]$BatchSize = 2000,
@@ -64,7 +65,7 @@ if (-not (Test-Path -LiteralPath $ConfigDir)) {
     New-Item -Path $ConfigDir -ItemType Directory -Force | Out-Null
 }
 $LogPath = Join-Path $ConfigDir 'evtxrelay.log'
-$IndexName = "$Tool-events"
+if (-not $IndexName) { $IndexName = "$Tool-events" }
 
 
 # LOGGING
