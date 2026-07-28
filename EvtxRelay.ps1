@@ -22,6 +22,17 @@
 
 .EXAMPLE
     .\EvtxRelay.ps1 -File .\path.csv -Tool chainsaw -ElkHost 10.10.10.5
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -File .\path.csv -Tool evtxecmd -UseSshTunnel `
+        -SshUser security-engineer -SshKeyPath ~\.ssh\engineer.pem
+
+    first run with -UseSshTunnel: use this when elasticsearch/kibana can only
+    be reached from inside the server itself, not from outside. the script
+    opens a background connection through ssh to reach them, and reuses that
+    same connection on later runs if it's still open. the ssh username, key,
+    and ports are remembered after the first run, so later runs only need
+    -File and -Tool.
 #>
 [CmdletBinding()]
 param(
@@ -40,7 +51,13 @@ param(
     [int]$BatchSize = 2000,
     [string]$TimestampField,
     [switch]$SkipCertificateCheck,
-    [switch]$ResetCredential
+    [switch]$ResetCredential,
+
+    [switch]$UseSshTunnel,
+    [string]$SshUser,
+    [string]$SshKeyPath,
+    [int]$RemoteElasticPort,
+    [int]$RemoteKibanaPort
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,18 +144,24 @@ function New-EvtxRelayConfigTemplate {
         [Parameter(Mandatory)][string]$LogPath
     )
     $template = [PSCustomObject]@{
-        ElkHost = $Placeholder
+        ElkHost           = $Placeholder
+        UseSshTunnel      = $false
+        SshUser           = ''
+        SshKeyPath        = ''
+        RemoteElasticPort = 9200
+        RemoteKibanaPort  = 443
     }
     $template | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath
-    Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Edit 'ElkHost' before running again."
+    Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Edit 'ElkHost' (and the SSH fields, if you need -UseSshTunnel) before running again."
 }
 
-# loads the saved settings file, mixes in any value passed on the command
-# line, and makes sure an elk host is actually set before continuing
+# loads the saved settings file, mixes in any values passed on the command
+# line, and makes sure everything needed is actually set before continuing
 function Get-EvtxRelayConfig {
     param(
         [Parameter(Mandatory)][string]$ConfigDir,
         [string]$ElkHostOverride,
+        [Parameter(Mandatory)][hashtable]$SshOverrides,
         [Parameter(Mandatory)][string]$LogPath,
         [Parameter(Mandatory)][string]$ElkHostPlaceholder
     )
@@ -146,7 +169,7 @@ function Get-EvtxRelayConfig {
 
     if (-not (Test-Path -LiteralPath $configPath)) {
         New-EvtxRelayConfigTemplate -ConfigPath $configPath -Placeholder $ElkHostPlaceholder -LogPath $LogPath
-        throw "config.json did not exist, so a template was created at '$configPath'. Fill in 'ElkHost', then run again."
+        throw "config.json did not exist, so a template was created at '$configPath'. Fill in 'ElkHost' (and SSH fields if you use -UseSshTunnel), then run again."
     }
 
     try {
@@ -162,8 +185,42 @@ function Get-EvtxRelayConfig {
         throw "No ELK host is set. Pass -ElkHost explicitly, or edit 'ElkHost' in '$configPath' (it's currently unset or still the placeholder value)."
     }
 
+    $useSshTunnelValue = if ($SshOverrides.ContainsKey('UseSshTunnel')) { [bool]$SshOverrides.UseSshTunnel }
+    elseif ($null -ne $cached.UseSshTunnel) { [bool]$cached.UseSshTunnel }
+    else { $false }
+
+    $sshUserValue = if ($SshOverrides.SshUser) { $SshOverrides.SshUser }
+    elseif ($cached.SshUser) { $cached.SshUser }
+    else { $null }
+
+    $sshKeyPathValue = if ($SshOverrides.SshKeyPath) { $SshOverrides.SshKeyPath }
+    elseif ($cached.SshKeyPath) { $cached.SshKeyPath }
+    else { $null }
+
+    $remoteElasticPortValue = if ($SshOverrides.ContainsKey('RemoteElasticPort')) { [int]$SshOverrides.RemoteElasticPort }
+    elseif ($cached.RemoteElasticPort) { [int]$cached.RemoteElasticPort }
+    else { 9200 }
+
+    $remoteKibanaPortValue = if ($SshOverrides.ContainsKey('RemoteKibanaPort')) { [int]$SshOverrides.RemoteKibanaPort }
+    elseif ($cached.RemoteKibanaPort) { [int]$cached.RemoteKibanaPort }
+    else { 443 }
+
+    if ($useSshTunnelValue) {
+        if ([string]::IsNullOrWhiteSpace($sshUserValue)) {
+            throw 'SSH tunnel is enabled (-UseSshTunnel) but no SSH username is set. Pass -SshUser once so it can be cached.'
+        }
+        if ([string]::IsNullOrWhiteSpace($sshKeyPathValue)) {
+            throw 'SSH tunnel is enabled (-UseSshTunnel) but no SSH key path is set. Pass -SshKeyPath once so it can be cached.'
+        }
+    }
+
     $configObject = [PSCustomObject]@{
-        ElkHost = $elkHostValue
+        ElkHost           = $elkHostValue
+        UseSshTunnel      = $useSshTunnelValue
+        SshUser           = $sshUserValue
+        SshKeyPath        = $sshKeyPathValue
+        RemoteElasticPort = $remoteElasticPortValue
+        RemoteKibanaPort  = $remoteKibanaPortValue
     }
     $configObject | ConvertTo-Json | Set-Content -LiteralPath $configPath
 
@@ -206,6 +263,78 @@ function Get-EvtxRelayCredential {
     $cred = New-Object System.Management.Automation.PSCredential($userName, $securePassword)
     $cred | Export-Clixml -LiteralPath $credPath
     return $cred
+}
+
+
+# SSH TUNNEL
+
+
+# checks whether something is already listening on a given port on this
+# computer
+function Test-LocalPortOpen {
+    param([Parameter(Mandatory)][int]$Port)
+    $result = Test-NetConnection -ComputerName 'localhost' -Port $Port -WarningAction SilentlyContinue -InformationLevel Quiet
+    return [bool]$result
+}
+
+# opens a background ssh connection to reach elasticsearch/kibana, or reuses
+# one that's already open
+function Confirm-SshTunnel {
+    param(
+        [Parameter(Mandatory)][string]$ElkHost,
+        [Parameter(Mandatory)][string]$SshUser,
+        [Parameter(Mandatory)][string]$SshKeyPath,
+        [Parameter(Mandatory)][int]$LocalElasticPort,
+        [Parameter(Mandatory)][int]$RemoteElasticPort,
+        [Parameter(Mandatory)][int]$LocalKibanaPort,
+        [Parameter(Mandatory)][int]$RemoteKibanaPort,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    # turn the key path into a full path ourselves first. if the path starts
+    # with '~' (short for "home folder") and we don't expand it here, ssh
+    # would get the literal text '~\...' and misread it as part of a
+    # username instead of a folder.
+    try {
+        $resolvedKeyPath = (Resolve-Path -LiteralPath $SshKeyPath -ErrorAction Stop).ProviderPath
+    }
+    catch {
+        throw "SSH key file not found at '$SshKeyPath'."
+    }
+
+    if ((Test-LocalPortOpen -Port $LocalElasticPort) -and (Test-LocalPortOpen -Port $LocalKibanaPort)) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "SSH tunnel already up on local ports $LocalElasticPort/$LocalKibanaPort; reusing it."
+        return
+    }
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Starting background SSH tunnel to ${SshUser}@${ElkHost}: local $LocalElasticPort -> remote localhost:$RemoteElasticPort (Elasticsearch), local $LocalKibanaPort -> remote localhost:$RemoteKibanaPort (Kibana)."
+
+    $sshArgs = @(
+        '-i', $resolvedKeyPath,
+        '-N',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'ExitOnForwardFailure=yes',
+        '-o', 'BatchMode=yes',
+        '-L', "${LocalElasticPort}:localhost:${RemoteElasticPort}",
+        '-L', "${LocalKibanaPort}:localhost:${RemoteKibanaPort}",
+        "$SshUser@$ElkHost"
+    )
+    # a working tunnel stays open and never "finishes", so we start ssh in
+    # the background and check the local ports instead of waiting on it.
+    # a passphrase-protected key fails fast here instead of hanging forever.
+    Start-Process -FilePath 'ssh' -ArgumentList $sshArgs -NoNewWindow | Out-Null
+
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 500
+        $up = (Test-LocalPortOpen -Port $LocalElasticPort) -and (Test-LocalPortOpen -Port $LocalKibanaPort)
+    } while (-not $up -and (Get-Date) -lt $deadline)
+
+    if (-not $up) {
+        throw "SSH tunnel did not come up within 10 seconds on local ports $LocalElasticPort/$LocalKibanaPort. Try connecting manually to check: ssh -i `"$SshKeyPath`" $SshUser@$ElkHost"
+    }
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message 'SSH tunnel is up.'
 }
 
 
@@ -526,15 +655,34 @@ function Confirm-KibanaSavedSearch {
 Write-EvtxRelayLog -LogPath $LogPath -Message "=== EvtxRelay start: File='$File' Tool='$Tool' ==="
 
 try {
-    $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
+    $sshOverrides = @{}
+    if ($PSBoundParameters.ContainsKey('UseSshTunnel')) { $sshOverrides.UseSshTunnel = $UseSshTunnel.IsPresent }
+    if ($SshUser) { $sshOverrides.SshUser = $SshUser }
+    if ($SshKeyPath) { $sshOverrides.SshKeyPath = $SshKeyPath }
+    if ($PSBoundParameters.ContainsKey('RemoteElasticPort')) { $sshOverrides.RemoteElasticPort = $RemoteElasticPort }
+    if ($PSBoundParameters.ContainsKey('RemoteKibanaPort')) { $sshOverrides.RemoteKibanaPort = $RemoteKibanaPort }
+
+    $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -SshOverrides $sshOverrides -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
     $cred = Get-EvtxRelayCredential -ConfigDir $ConfigDir -Reset:$ResetCredential -LogPath $LogPath
+
+    if ($config.UseSshTunnel) {
+        Confirm-SshTunnel -ElkHost $config.ElkHost -SshUser $config.SshUser -SshKeyPath $config.SshKeyPath `
+            -LocalElasticPort $ElasticPort -RemoteElasticPort $config.RemoteElasticPort `
+            -LocalKibanaPort $KibanaPort -RemoteKibanaPort $config.RemoteKibanaPort -LogPath $LogPath
+    }
 
     $pair = "$($cred.UserName):$($cred.GetNetworkCredential().Password)"
     $basicAuth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pair))
     $authHeaders = @{ Authorization = "Basic $basicAuth" }
 
-    $elasticBaseUri = "https://$($config.ElkHost):$ElasticPort"
-    $kibanaBaseUri = "https://$($config.ElkHost):$KibanaPort"
+    # the ssh tunnel connects to this same computer instead of the server's
+    # real address, so its https certificate never matches. skip that check
+    # automatically in that case.
+    $effectiveSkipCertCheck = [bool]($SkipCertificateCheck -or $config.UseSshTunnel)
+    $connectHost = if ($config.UseSshTunnel) { '127.0.0.1' } else { $config.ElkHost }
+
+    $elasticBaseUri = "https://${connectHost}:$ElasticPort"
+    $kibanaBaseUri = "https://${connectHost}:$KibanaPort"
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Reading CSV: $File"
     $records = @(Import-Csv -Path $File -Encoding UTF8)
@@ -557,15 +705,15 @@ try {
         }
     }
     if ($resolvedTimestampField) {
-        Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field."
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
     }
     else {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column. Pass -TimestampField to override."
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column; saved search will not be time-sorted. Pass -TimestampField to override."
     }
 
     $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
         -IndexName $IndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -SkipCertificateCheck:$effectiveSkipCertCheck
     if ($indexCreated -and $resolvedTimestampField -and $TimestampFormats.ContainsKey($Tool)) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$resolvedTimestampField'."
     }
@@ -583,7 +731,7 @@ try {
 
         $response = Invoke-ElkRequest -Uri "$elasticBaseUri/$IndexName/_bulk" -Method Post `
             -Headers $authHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
-            -SkipCertificateCheck:$SkipCertificateCheck
+            -SkipCertificateCheck:$effectiveSkipCertCheck
 
         if ($response.errors) {
             for ($j = 0; $j -lt $response.items.Count; $j++) {
@@ -623,7 +771,7 @@ try {
 
     Write-EvtxRelayLog -LogPath $LogPath -Message 'Verifying column coverage against index mapping...'
     $missingColumns = Test-IndexColumnCoverage -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
-        -IndexName $IndexName -ExpectedFields $sanitizedFields -SkipCertificateCheck:$SkipCertificateCheck
+        -IndexName $IndexName -ExpectedFields $sanitizedFields -SkipCertificateCheck:$effectiveSkipCertCheck
 
     if ($missingColumns.Count -gt 0) {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Columns missing from mapping (all values may have been null/empty): $($missingColumns -join ', ')"
@@ -636,12 +784,12 @@ try {
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
     $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-        -IndexName $IndexName -TimestampField $resolvedTimestampField -SkipCertificateCheck:$SkipCertificateCheck
+        -IndexName $IndexName -TimestampField $resolvedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
     $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
         -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $resolvedTimestampField `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -SkipCertificateCheck:$effectiveSkipCertCheck
 
     # PRINT A SUMMARY
 
