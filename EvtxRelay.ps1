@@ -649,6 +649,144 @@ function Confirm-KibanaSavedSearch {
 }
 
 
+# PER-FILE PROCESSING
+
+
+# picks which sanitized column to use as the date/time field, given a
+# priority list of candidate names and an optional manual override
+function Resolve-EvtxRelayTimestampField {
+    param(
+        [Parameter(Mandatory)][string[]]$SanitizedFields,
+        [string[]]$Candidates = @(),
+        [string]$Override
+    )
+    if ($Override) { return $Override }
+    foreach ($candidate in $Candidates) {
+        if ($SanitizedFields -contains $candidate) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+# uploads one already-loaded csv's rows into elasticsearch, creates the
+# index and kibana data view/saved search if needed, and returns a
+# summary of what happened
+function Invoke-EvtxRelayFileUpload {
+    param(
+        [Parameter(Mandatory)][array]$Records,
+        [Parameter(Mandatory)]$HeaderMap,
+        [Parameter(Mandatory)][string[]]$SanitizedFields,
+        [Parameter(Mandatory)][string]$IndexName,
+        [string]$TimestampField,
+        [string]$TimestampFormat,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -TimestampField $TimestampField -TimestampFormat $TimestampFormat `
+        -SkipCertificateCheck:$SkipCertificateCheck
+    if ($indexCreated -and $TimestampField -and $TimestampFormat) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$TimestampField'."
+    }
+
+    # UPLOAD THE DATA IN BATCHES
+
+    $totalRows = $Records.Count
+    $bulkErrors = New-Object System.Collections.Generic.List[object]
+
+    for ($start = 0; $start -lt $totalRows; $start += $BatchSize) {
+        $end = [Math]::Min($start + $BatchSize, $totalRows) - 1
+        $batch = $Records[$start..$end]
+        $sanitizedBatch = @(foreach ($r in $batch) { ConvertTo-SanitizedRecord -Record $r -HeaderMap $HeaderMap })
+        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $sanitizedBatch
+
+        $response = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_bulk" -Method Post `
+            -Headers $AuthHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        if ($response.errors) {
+            for ($j = 0; $j -lt $response.items.Count; $j++) {
+                $item = $response.items[$j].index
+                if ($item.error) {
+                    # elasticsearch's main error message is often vague (like
+                    # "failed to parse"); the real, useful detail is usually
+                    # buried in the nested "caused by" messages underneath it,
+                    # so collect all of them
+                    $detailParts = New-Object System.Collections.Generic.List[string]
+                    $errNode = $item.error
+                    while ($errNode) {
+                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
+                        $errNode = $errNode.caused_by
+                    }
+                    $bulkErrors.Add([PSCustomObject]@{
+                        Row    = $start + $j + 1
+                        Type   = $item.error.type
+                        Reason = ($detailParts -join ' <- caused by: ')
+                    })
+                }
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed rows $($start + 1)-$($end + 1) of $totalRows into '$IndexName'."
+    }
+
+    $rowsIndexed = $totalRows - $bulkErrors.Count
+    if ($bulkErrors.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) row(s) failed to index:"
+        foreach ($e in $bulkErrors) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Row $($e.Row): $($e.Reason)"
+        }
+    }
+
+    # DOUBLE CHECK NOTHING WAS LOST
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message 'Verifying column coverage against index mapping...'
+    $missingColumns = Test-IndexColumnCoverage -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -ExpectedFields $SanitizedFields -SkipCertificateCheck:$SkipCertificateCheck
+
+    if ($missingColumns.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Columns missing from mapping (all values may have been null/empty): $($missingColumns -join ', ')"
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "All $($SanitizedFields.Count) columns present in the index mapping. No column loss detected."
+    }
+
+    # SET UP KIBANA
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+    $dataView = Confirm-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -TimestampField $TimestampField -SkipCertificateCheck:$SkipCertificateCheck
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+    $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $TimestampField `
+        -SkipCertificateCheck:$SkipCertificateCheck
+
+    # PRINT A SUMMARY
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Rows indexed:        $rowsIndexed / $totalRows"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Column loss:         $(if ($missingColumns.Count -gt 0) { "$($missingColumns.Count) column(s) missing" } else { 'none' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+
+    return [PSCustomObject]@{
+        IndexName          = $IndexName
+        TotalRows          = $totalRows
+        RowsIndexed        = $rowsIndexed
+        MissingColumns      = $missingColumns
+        DataViewCreated    = $dataView.Created
+        SavedSearchCreated = $savedSearch.Created
+    }
+}
+
+
 # MAIN
 
 
@@ -695,15 +833,8 @@ try {
     $sanitizedFields = @($headerMap.Values)
     Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
 
-    $resolvedTimestampField = $TimestampField
-    if (-not $resolvedTimestampField) {
-        foreach ($candidate in $TimestampCandidates[$Tool]) {
-            if ($sanitizedFields -contains $candidate) {
-                $resolvedTimestampField = $candidate
-                break
-            }
-        }
-    }
+    $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
+        -Candidates $TimestampCandidates[$Tool] -Override $TimestampField
     if ($resolvedTimestampField) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
     }
@@ -711,93 +842,11 @@ try {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column; saved search will not be time-sorted. Pass -TimestampField to override."
     }
 
-    $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+    Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
         -IndexName $IndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
-        -SkipCertificateCheck:$effectiveSkipCertCheck
-    if ($indexCreated -and $resolvedTimestampField -and $TimestampFormats.ContainsKey($Tool)) {
-        Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$resolvedTimestampField'."
-    }
+        -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+        -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
 
-    # UPLOAD THE DATA IN BATCHES
-
-    $totalRows = $records.Count
-    $bulkErrors = New-Object System.Collections.Generic.List[object]
-
-    for ($start = 0; $start -lt $totalRows; $start += $BatchSize) {
-        $end = [Math]::Min($start + $BatchSize, $totalRows) - 1
-        $batch = $records[$start..$end]
-        $sanitizedBatch = @(foreach ($r in $batch) { ConvertTo-SanitizedRecord -Record $r -HeaderMap $headerMap })
-        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $sanitizedBatch
-
-        $response = Invoke-ElkRequest -Uri "$elasticBaseUri/$IndexName/_bulk" -Method Post `
-            -Headers $authHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
-            -SkipCertificateCheck:$effectiveSkipCertCheck
-
-        if ($response.errors) {
-            for ($j = 0; $j -lt $response.items.Count; $j++) {
-                $item = $response.items[$j].index
-                if ($item.error) {
-                    # elasticsearch's main error message is often vague (like
-                    # "failed to parse"); the real, useful detail is usually
-                    # buried in the nested "caused by" messages underneath it,
-                    # so collect all of them
-                    $detailParts = New-Object System.Collections.Generic.List[string]
-                    $errNode = $item.error
-                    while ($errNode) {
-                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
-                        $errNode = $errNode.caused_by
-                    }
-                    $bulkErrors.Add([PSCustomObject]@{
-                        Row    = $start + $j + 1
-                        Type   = $item.error.type
-                        Reason = ($detailParts -join ' <- caused by: ')
-                    })
-                }
-            }
-        }
-
-        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed rows $($start + 1)-$($end + 1) of $totalRows into '$IndexName'."
-    }
-
-    $rowsIndexed = $totalRows - $bulkErrors.Count
-    if ($bulkErrors.Count -gt 0) {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) row(s) failed to index:"
-        foreach ($e in $bulkErrors) {
-            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Row $($e.Row): $($e.Reason)"
-        }
-    }
-
-    # DOUBLE CHECK NOTHING WAS LOST
-
-    Write-EvtxRelayLog -LogPath $LogPath -Message 'Verifying column coverage against index mapping...'
-    $missingColumns = Test-IndexColumnCoverage -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
-        -IndexName $IndexName -ExpectedFields $sanitizedFields -SkipCertificateCheck:$effectiveSkipCertCheck
-
-    if ($missingColumns.Count -gt 0) {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Columns missing from mapping (all values may have been null/empty): $($missingColumns -join ', ')"
-    }
-    else {
-        Write-EvtxRelayLog -LogPath $LogPath -Message "All $($sanitizedFields.Count) columns present in the index mapping. No column loss detected."
-    }
-
-    # SET UP KIBANA
-
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
-    $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-        -IndexName $IndexName -TimestampField $resolvedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
-
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
-    $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-        -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $resolvedTimestampField `
-        -SkipCertificateCheck:$effectiveSkipCertCheck
-
-    # PRINT A SUMMARY
-
-    Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Rows indexed:        $rowsIndexed / $totalRows"
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Column loss:         $(if ($missingColumns.Count -gt 0) { "$($missingColumns.Count) column(s) missing" } else { 'none' })"
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
 }
 catch {
