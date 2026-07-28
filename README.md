@@ -181,11 +181,12 @@ trusts).
 .\EvtxRelay.ps1 -File .\your-file.csv -Tool evtxecmd -ElkHost 192.168.1.50 -SkipCertificateCheck
 ```
 
-**After the first run**, `-ElkHost` is cached in `config.json` -- you only
-need `-File` and `-Tool` from then on:
+**After the first run**, `-ElkHost` is cached in `config.json`. However,
+`-SkipCertificateCheck` is not cached and must be passed on every run if
+your lab certificate is self-signed:
 
 ```powershell
-.\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa
+.\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa -SkipCertificateCheck
 ```
 
 ## Parameters
@@ -200,7 +201,7 @@ need `-File` and `-Tool` from then on:
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-BatchSize`            | No            | `2000`       | Rows sent per bulk request. |
 | `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. |
-| `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS certificates. Turned on automatically when `-UseSshTunnel` is used. |
+| `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS or lab certificates. Turned on automatically when `-UseSshTunnel` is used. |
 | `-ResetCredential`      | No            | off          | Asks for your credentials again, for example after a password change. |
 | `-UseSshTunnel`         | No            | off (saved)  | Opens or reuses a background SSH tunnel to reach an Elasticsearch or Kibana that only listens on the VPS's own localhost. |
 | `-SshUser`              | If tunneling  | saved value  | SSH username for the tunnel. |
