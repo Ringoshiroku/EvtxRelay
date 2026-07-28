@@ -1,0 +1,7 @@
+# deny everything by default, only allow specific files back in
+/*
+
+# allowed files
+!/EvtxRelay.ps1
+!/README.md
+!/.gitignore
