@@ -2,12 +2,13 @@
 
 EvtxRelay is a single PowerShell script that takes a CSV (a plain-text
 spreadsheet file, one row per event) timeline produced by Hayabusa,
-Chainsaw, or EvtxECmd and pushes it into an existing ELK (Elasticsearch and
-Kibana) stack. It bulk indexes the data, checks that no column was lost
-along the way, and leaves you with a ready to open Kibana saved search. It
-has no server side component and does not wrap the parser tools themselves:
-you run Hayabusa, Chainsaw, or EvtxECmd yourself, then hand the resulting
-CSV to EvtxRelay.
+Chainsaw, EvtxECmd, or APT-Hunter and pushes it into an existing ELK
+(Elasticsearch and Kibana) stack. It bulk indexes the data, checks that no
+column was lost along the way, and leaves you with a ready to open Kibana
+saved search. It has no server side component and does not wrap the parser
+tools themselves: you run Hayabusa, Chainsaw, EvtxECmd, or APT-Hunter
+yourself, then hand the resulting CSV (or, for APT-Hunter, its output
+folder) to EvtxRelay.
 
 This works the same way whether Elasticsearch/Kibana live on a remote VPS
 or on a lab machine on your own local network (same office/lab WiFi, for
@@ -52,11 +53,41 @@ and tell it which schema to expect with `-Tool`:
 .\EvtxRelay.ps1 -File .\crownjewel2.csv -Tool hayabusa
 .\EvtxRelay.ps1 -File .\path.csv -Tool chainsaw
 .\EvtxRelay.ps1 -File .\htb-trojan-system.csv -Tool evtxecmd
+.\EvtxRelay.ps1 -Folder .\apt-hunter-output -Tool apt-hunter
 ```
 
-`-Tool` only accepts `hayabusa`, `chainsaw`, or `evtxecmd`. It is never
-guessed from the CSV headers, since each tool's schema can change across
-versions and being explicit is safer than guessing.
+`-Tool` only accepts `hayabusa`, `chainsaw`, `evtxecmd`, or `apt-hunter`. It
+is never guessed from the CSV headers, since each tool's schema can change
+across versions and being explicit is safer than guessing.
+
+### APT-Hunter is different: a folder of CSVs, not one file
+
+APT-Hunter writes one CSV per event category into a single output folder
+(logons, process execution, its combined TimeSketch timeline, and so on),
+instead of one CSV like the other three tools. Point `-Folder` at that
+folder instead of using `-File`, and EvtxRelay uploads every `.csv` it
+finds there in one run, each into its own index named
+`apt-hunter-<category>` (for example `apt-hunter-logon_events`,
+`apt-hunter-timesketch`). The category name comes from each file's own
+name, so it follows whatever you named the APT-Hunter run.
+
+A couple of files get skipped automatically rather than uploaded, and this
+is normal, not an error:
+
+- A file with no data rows (APT-Hunter creates one file per category even
+  when nothing matched it).
+- A file with no recognizable date/time column, like the SID-to-username
+  lookup table APT-Hunter also writes out. It isn't a timeline, so there's
+  nothing to sort a saved search by.
+
+Each file is independent: if one fails to upload, EvtxRelay logs it and
+keeps going with the rest, then prints a summary of every file's outcome
+at the end. The run only reports an overall failure if at least one file
+truly failed, not for skipped files.
+
+The APT-Hunter `.xlsx` report is not used by EvtxRelay; the `.csv` files in
+the same output folder already contain the same detections in a simpler
+format to parse.
 
 ### Setting up `.evtxrelay\config.json` before your first real run
 
@@ -153,12 +184,22 @@ above for why that happens.
     -RemoteKibanaPort 443
 ```
 
+```powershell
+.\EvtxRelay.ps1 -Folder .\your-apt-hunter-output -Tool apt-hunter -ElkHost 10.10.10.5 -UseSshTunnel `
+    -SshUser security-engineer -SshKeyPath ~\.ssh\engineer.pem `
+    -RemoteKibanaPort 443
+```
+
 **After the first run**, `-ElkHost`, `-UseSshTunnel`, `-SshUser`,
 `-SshKeyPath`, and `-RemoteKibanaPort` are all cached in `config.json` --
-you only need `-File` and `-Tool` from then on:
+you only need `-File`/`-Folder` and `-Tool` from then on:
 
 ```powershell
 .\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa
+```
+
+```powershell
+.\EvtxRelay.ps1 -Folder .\your-next-apt-hunter-output -Tool apt-hunter
 ```
 
 ### Direct connection (same-network lab)
@@ -181,6 +222,10 @@ trusts).
 .\EvtxRelay.ps1 -File .\your-file.csv -Tool evtxecmd -ElkHost 192.168.1.50 -SkipCertificateCheck
 ```
 
+```powershell
+.\EvtxRelay.ps1 -Folder .\your-apt-hunter-output -Tool apt-hunter -ElkHost 192.168.1.50 -SkipCertificateCheck
+```
+
 **After the first run**, `-ElkHost` is cached in `config.json`. However,
 `-SkipCertificateCheck` is not cached and must be passed on every run if
 your lab certificate is self-signed:
@@ -189,18 +234,23 @@ your lab certificate is self-signed:
 .\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa -SkipCertificateCheck
 ```
 
+```powershell
+.\EvtxRelay.ps1 -Folder .\your-next-apt-hunter-output -Tool apt-hunter -SkipCertificateCheck
+```
+
 ## Parameters
 
 | Parameter              | Required     | Default      | Purpose |
 |------------------------|---------------|--------------|---------|
-| `-File`                 | Yes           | none         | Path to the CSV produced by the parser. |
-| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, or `evtxecmd`. Picks the target index and the timestamp field guess. |
-| `-IndexName`            | No            | `<tool>-events` | Overrides the Elasticsearch index (and matching Kibana Data View/saved search) name, if you don't want the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming. |
+| `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
+| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, or `apt-hunter`. Picks the target index and the timestamp field guess. |
+| `-Folder`               | If apt-hunter | none         | Path to the folder of CSVs produced by APT-Hunter. Only used with `-Tool apt-hunter`; every `.csv` in the folder is uploaded to its own index in one run. |
+| `-IndexName`            | No            | `<tool>-events` | Overrides the Elasticsearch index (and matching Kibana Data View/saved search) name, if you don't want the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming. With `-Tool apt-hunter`, this overrides the `apt-hunter` prefix instead, so each category becomes `<IndexName>-<category>` (for example `apt-hunter-logon_events`). |
 | `-ElkHost`              | No            | saved value  | Elasticsearch and Kibana host, or the SSH target host if using `-UseSshTunnel`. Works the same whether it's a remote VPS or a lab machine on your local network. Also updates the saved value. |
 | `-ElasticPort`          | No            | `9200`       | Local port EvtxRelay connects to for Elasticsearch. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-BatchSize`            | No            | `2000`       | Rows sent per bulk request. |
-| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. |
+| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. Not supported with `-Tool apt-hunter`, since each category file has its own differently-named date column. |
 | `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS or lab certificates. Turned on automatically when `-UseSshTunnel` is used. |
 | `-ResetCredential`      | No            | off          | Asks for your credentials again, for example after a password change. |
 | `-UseSshTunnel`         | No            | off (saved)  | Opens or reuses a background SSH tunnel to reach an Elasticsearch or Kibana that only listens on the VPS's own localhost. |
@@ -229,3 +279,8 @@ your lab certificate is self-signed:
 5. Prints a summary: rows indexed, whether any columns were lost, and
    whether the Data View and saved search were created or already existed.
    The same summary is added to `evtxrelay.log`.
+
+With `-Tool apt-hunter`, steps 1-5 happen once for each CSV in `-Folder`
+(skipping any file with no data rows or no recognizable timestamp column,
+as described above), and a batch summary listing every file's outcome is
+printed and logged at the end.
