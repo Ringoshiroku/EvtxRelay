@@ -30,6 +30,7 @@ param(
     [string]$ElkHost,
     [int]$ElasticPort = 9200,
     [int]$BatchSize = 2000,
+    [string]$TimestampField,
     [switch]$SkipCertificateCheck,
     [switch]$ResetCredential
 )
@@ -67,6 +68,23 @@ if (-not (Test-Path -LiteralPath $ConfigDir)) {
 $LogPath = Join-Path $ConfigDir 'evtxrelay.log'
 $ElkHostPlaceholder = '<ISI_IP_ATAU_HOSTNAME_ELK_DI_SINI>'
 if (-not $IndexName) { $IndexName = "$Tool-events" }
+
+# best guess at which column holds the date/time for each tool, used only if
+# -timestampfield isn't given by hand.
+$TimestampCandidates = @{
+    hayabusa = @('Timestamp')
+    chainsaw = @('timestamp', 'Timestamp', 'Event_System_TimeCreated_SystemTime')
+    evtxecmd = @('TimeCreated')
+}
+
+# elasticsearch only auto-recognizes a few common date styles. hayabusa and
+# evtxecmd don't match, so their exact format is spelled out here. chainsaw
+# already matches on its own, so it isn't listed. without this, the date
+# column would silently be stored as plain text instead of a real date.
+$TimestampFormats = @{
+    hayabusa = 'yyyy-MM-dd HH:mm:ss.SSS XXX||strict_date_optional_time||epoch_millis'
+    evtxecmd = 'yyyy-MM-dd HH:mm:ss.SSSSSSS||strict_date_optional_time||epoch_millis'
+}
 
 
 # LOGGING
@@ -280,6 +298,55 @@ function ConvertTo-BulkBody {
 }
 
 
+# INDEX SETUP
+
+
+# creates the index if it doesn't exist yet, telling elasticsearch ahead of
+# time which column holds the date/time and what format it's in
+function Confirm-IndexWithTimestampMapping {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [string]$TimestampField,
+        [string]$TimestampFormat,
+        [switch]$SkipCertificateCheck
+    )
+
+    try {
+        Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName" -Method Get `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+        return $false
+    }
+    catch {
+        if (-not ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound)) {
+            throw
+        }
+    }
+
+    # the index doesn't exist yet, so create it. if we know the date format,
+    # tell elasticsearch up front instead of letting it guess. a wrong guess
+    # silently turns the date column into plain text and breaks kibana's
+    # time-based graphs later.
+    $body = @{}
+    if ($TimestampField -and $TimestampFormat) {
+        $body = @{
+            mappings = @{
+                properties = @{
+                    $TimestampField = @{ type = 'date'; format = $TimestampFormat }
+                }
+            }
+        }
+    }
+
+    Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName" -Method Put `
+        -Headers $AuthHeaders -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
+        -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+
+    return $true
+}
+
+
 # MAIN
 
 
@@ -305,6 +372,29 @@ try {
     $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
     $sanitizedFields = @($headerMap.Values)
     Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
+
+    $resolvedTimestampField = $TimestampField
+    if (-not $resolvedTimestampField) {
+        foreach ($candidate in $TimestampCandidates[$Tool]) {
+            if ($sanitizedFields -contains $candidate) {
+                $resolvedTimestampField = $candidate
+                break
+            }
+        }
+    }
+    if ($resolvedTimestampField) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field."
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column. Pass -TimestampField to override."
+    }
+
+    $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+        -IndexName $IndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
+        -SkipCertificateCheck:$SkipCertificateCheck
+    if ($indexCreated -and $resolvedTimestampField -and $TimestampFormats.ContainsKey($Tool)) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$resolvedTimestampField'."
+    }
 
     # UPLOAD THE DATA IN BATCHES
 
