@@ -1,25 +1,36 @@
 # EvtxRelay
 
-EvtxRelay is a single PowerShell script that takes a CSV timeline produced by
-Hayabusa, Chainsaw, or EvtxECmd and pushes it into an existing ELK
-(Elasticsearch and Kibana) stack. It bulk indexes the data, checks that no
-column was lost along the way, and leaves you with a ready to open Kibana
-saved search. It has no server side component and does not wrap the parser
-tools themselves: you run Hayabusa, Chainsaw, or EvtxECmd yourself, then hand
-the resulting CSV to EvtxRelay.
+EvtxRelay is a single PowerShell script that takes a CSV (a plain-text
+spreadsheet file, one row per event) timeline produced by Hayabusa,
+Chainsaw, or EvtxECmd and pushes it into an existing ELK (Elasticsearch and
+Kibana) stack. It bulk indexes the data, checks that no column was lost
+along the way, and leaves you with a ready to open Kibana saved search. It
+has no server side component and does not wrap the parser tools themselves:
+you run Hayabusa, Chainsaw, or EvtxECmd yourself, then hand the resulting
+CSV to EvtxRelay.
+
+This works the same way whether Elasticsearch/Kibana live on a remote VPS
+or on a lab machine on your own local network (same office/lab WiFi, for
+example) -- EvtxRelay just needs to be able to reach the host over HTTPS,
+wherever that host actually is. See [Quick commands](#quick-commands) below
+for ready-to-run examples of both.
 
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7 or newer.
-- A way to reach the VPS's Elasticsearch (port 9200) and Kibana (port 5601)
-  over HTTPS from your workstation. If those ports are only open on the
-  VPS's own localhost, you can use `-UseSshTunnel` instead (see below), which
-  needs Windows' OpenSSH client (`ssh`) on your `PATH`.
+- A way to reach Elasticsearch (port 9200) and Kibana (port 5601) over
+  HTTPS from your workstation -- whether the ELK host is a remote VPS or a
+  lab machine on the same local network. If those ports are only reachable
+  from the ELK host's own localhost (common on a VPS with no reverse proxy
+  set up for Elasticsearch), you can use `-UseSshTunnel` instead (see
+  below), which needs Windows' OpenSSH client (`ssh`) on your `PATH`.
 - Elastic and Kibana credentials that can write to indices and create saved
   objects.
-- Kibana 7.x or 8.x. On 8.x the script uses Kibana's Data Views API. On 7.x,
-  where that API does not exist, it falls back automatically to the older
-  Saved Objects API for the same underlying index pattern object.
+- Kibana 7.x or 8.x. Kibana's concept of "which index to search" is called
+  a **Data View** on 8.x; the same concept on 7.x is called an **index
+  pattern** and is managed through an older API. EvtxRelay detects which
+  one your Kibana has and uses the matching one automatically -- you don't
+  need to do anything differently either way.
 
 ## Built-in help
 
@@ -134,7 +145,10 @@ it yourself, find and stop the background `ssh` process with
 
 ## What each run does
 
-1. Reads the CSV, strips a BOM if one is present, and replaces any dots in
+1. Reads the CSV, strips a BOM if one is present (a BOM, or byte order
+   mark, is a few invisible bytes some tools put at the very start of a
+   file to mark its text encoding -- harmless to the file itself, but it
+   corrupts the first column's name if left in), and replaces any dots in
    column names with underscores, since Elasticsearch treats dots as
    nested-object separators.
 2. Bulk indexes every row into a stable index named `<tool>-events` by
