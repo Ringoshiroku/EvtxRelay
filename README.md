@@ -123,6 +123,71 @@ running after the script finishes, which is fine to leave as is. To close
 it yourself, find and stop the background `ssh` process with
 `Get-Process ssh | Stop-Process`.
 
+## Quick commands
+
+Ready-to-run examples for both ways of reaching Elasticsearch/Kibana. Swap
+in your own file path and (for the first run only) your own `-ElkHost`.
+
+### Via SSH tunnel (remote VPS)
+
+Use this when Elasticsearch/Kibana are only reachable from the VPS's own
+localhost -- see [If Elasticsearch or Kibana only listen on the VPS's own
+localhost](#if-elasticsearch-or-kibana-only-listen-on-the-vpss-own-localhost)
+above for why that happens.
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-file.csv -Tool hayabusa -ElkHost 10.10.10.5 -UseSshTunnel `
+    -SshUser security-engineer -SshKeyPath ~\.ssh\engineer.pem `
+    -RemoteKibanaPort 443
+```
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-file.csv -Tool chainsaw -ElkHost 10.10.10.5 -UseSshTunnel `
+    -SshUser security-engineer -SshKeyPath ~\.ssh\engineer.pem `
+    -RemoteKibanaPort 443
+```
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-file.csv -Tool evtxecmd -ElkHost 10.10.10.5 -UseSshTunnel `
+    -SshUser security-engineer -SshKeyPath ~\.ssh\engineer.pem `
+    -RemoteKibanaPort 443
+```
+
+**After the first run**, `-ElkHost`, `-UseSshTunnel`, `-SshUser`,
+`-SshKeyPath`, and `-RemoteKibanaPort` are all cached in `config.json` --
+you only need `-File` and `-Tool` from then on:
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa
+```
+
+### Direct connection (same-network lab)
+
+Use this when Elasticsearch/Kibana are directly reachable from your
+workstation -- for example a lab ELK stack on the same WiFi/LAN. No SSH
+tunnel needed; `-SkipCertificateCheck` is for a self-signed lab
+certificate (omit it if the lab uses a certificate your machine already
+trusts).
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-file.csv -Tool hayabusa -ElkHost 192.168.1.50 -SkipCertificateCheck
+```
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-file.csv -Tool chainsaw -ElkHost 192.168.1.50 -SkipCertificateCheck
+```
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-file.csv -Tool evtxecmd -ElkHost 192.168.1.50 -SkipCertificateCheck
+```
+
+**After the first run**, `-ElkHost` is cached in `config.json` -- you only
+need `-File` and `-Tool` from then on:
+
+```powershell
+.\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa
+```
+
 ## Parameters
 
 | Parameter              | Required     | Default      | Purpose |
