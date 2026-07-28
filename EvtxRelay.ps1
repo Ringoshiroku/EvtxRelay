@@ -2,13 +2,20 @@
 <#
 .SYNOPSIS
     takes a csv file (from hayabusa, chainsaw, or evtxecmd) and loads it into
-    elasticsearch in batches.
+    elasticsearch, then makes sure kibana has a matching data view and saved
+    search ready to open.
 
 .DESCRIPTION
     reads a csv made by one of the three tools, cleans up its column names
     (removes the hidden byte at the start of the file, swaps dots for
-    underscores), and uploads every row into elasticsearch in batches. login
-    details are cached after the first run.
+    underscores), uploads every row in batches, double checks that no column
+    got dropped along the way, and sets up a kibana data view and saved
+    search if they don't already exist. running it again on the same file is
+    safe and won't create duplicates.
+
+    kibana changed how data views are managed between versions, so this
+    script tries the newer way first and automatically falls back to the
+    older way if that fails.
 
 .EXAMPLE
     .\EvtxRelay.ps1 -File .\crownjewel2.csv -Tool hayabusa
@@ -29,6 +36,7 @@ param(
     [string]$IndexName,
     [string]$ElkHost,
     [int]$ElasticPort = 9200,
+    [int]$KibanaPort = 5601,
     [int]$BatchSize = 2000,
     [string]$TimestampField,
     [switch]$SkipCertificateCheck,
@@ -373,6 +381,145 @@ function Test-IndexColumnCoverage {
 }
 
 
+# KIBANA SETUP
+
+
+# makes sure kibana has a data view (its name for "which index to look at")
+# pointing at our index, creating one if it doesn't already exist
+function Confirm-KibanaDataView {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [string]$TimestampField,
+        [switch]$SkipCertificateCheck
+    )
+
+    # newer kibana versions have a dedicated way to manage data views. older
+    # versions don't have it and return a plain "not found" instead, so fall
+    # back to the older method in that case.
+    $useLegacyApi = $false
+    $existing = $null
+    try {
+        $listResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views" -Method Get `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+        $existing = $listResp.data_view | Where-Object { $_.title -eq $IndexName } | Select-Object -First 1
+    }
+    catch {
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+            $useLegacyApi = $true
+        }
+        else {
+            throw
+        }
+    }
+
+    if ($useLegacyApi) {
+        $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=index-pattern&per_page=1000" -Method Get `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+        $existingObj = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $IndexName } | Select-Object -First 1
+        if ($existingObj) {
+            return @{ Id = $existingObj.id; Created = $false }
+        }
+
+        $legacyBody = @{ attributes = @{ title = $IndexName } }
+        if ($TimestampField) { $legacyBody.attributes.timeFieldName = $TimestampField }
+
+        $createHeaders = $AuthHeaders.Clone()
+        $createHeaders['kbn-xsrf'] = 'true'
+
+        $legacyCreateResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/index-pattern" -Method Post `
+            -Headers $createHeaders -Body ($legacyBody | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        return @{ Id = $legacyCreateResp.id; Created = $true }
+    }
+
+    if ($existing) {
+        return @{ Id = $existing.id; Created = $false }
+    }
+
+    $body = @{ data_view = @{ title = $IndexName } }
+    if ($TimestampField) {
+        $body.data_view.timeFieldName = $TimestampField
+    }
+
+    $createHeaders = $AuthHeaders.Clone()
+    $createHeaders['kbn-xsrf'] = 'true'
+
+    $createResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views/data_view" -Method Post `
+        -Headers $createHeaders -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
+        -SkipCertificateCheck:$SkipCertificateCheck
+
+    return @{ Id = $createResp.data_view.id; Created = $true }
+}
+
+# makes sure a ready-to-open saved search exists in kibana for our index,
+# creating one if it doesn't already exist
+function Confirm-KibanaSavedSearch {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string]$DataViewId,
+        [string]$TimestampField,
+        [switch]$SkipCertificateCheck
+    )
+
+    $title = "$IndexName (EvtxRelay)"
+
+    $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=search&per_page=1000" `
+        -Method Get -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+    $existing = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $title } | Select-Object -First 1
+    if ($existing) {
+        return @{ Id = $existing.id; Created = $false }
+    }
+
+    # sort order must be written as [direction, column name], the reverse of
+    # what you'd expect. writing it the other way causes confusing errors.
+    $sort = @()
+    if ($TimestampField) {
+        $sort = @(, @('desc', $TimestampField))
+    }
+
+    # the saved search must point at the data view using this specific
+    # linking style, matching how kibana itself saves these.
+    $searchSource = @{
+        indexRefName = 'kibanaSavedObjectMeta.searchSourceJSON.index'
+        query        = @{ query = ''; language = 'kuery' }
+        filter       = @()
+        sort         = $sort
+    }
+
+    $body = @{
+        attributes = @{
+            title                 = $title
+            sort                  = $sort
+            columns               = @('_source')
+            kibanaSavedObjectMeta = @{
+                searchSourceJSON = ($searchSource | ConvertTo-Json -Compress -Depth 5)
+            }
+        }
+        references = @(
+            @{
+                id   = $DataViewId
+                name = 'kibanaSavedObjectMeta.searchSourceJSON.index'
+                type = 'index-pattern'
+            }
+        )
+    }
+
+    $createHeaders = $AuthHeaders.Clone()
+    $createHeaders['kbn-xsrf'] = 'true'
+
+    $createResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/search" -Method Post `
+        -Headers $createHeaders -Body ($body | ConvertTo-Json -Depth 6) -ContentType 'application/json' `
+        -SkipCertificateCheck:$SkipCertificateCheck
+
+    return @{ Id = $createResp.id; Created = $true }
+}
+
+
 # MAIN
 
 
@@ -387,6 +534,7 @@ try {
     $authHeaders = @{ Authorization = "Basic $basicAuth" }
 
     $elasticBaseUri = "https://$($config.ElkHost):$ElasticPort"
+    $kibanaBaseUri = "https://$($config.ElkHost):$KibanaPort"
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Reading CSV: $File"
     $records = @(Import-Csv -Path $File -Encoding UTF8)
@@ -484,11 +632,24 @@ try {
         Write-EvtxRelayLog -LogPath $LogPath -Message "All $($sanitizedFields.Count) columns present in the index mapping. No column loss detected."
     }
 
+    # SET UP KIBANA
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+    $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+        -IndexName $IndexName -TimestampField $resolvedTimestampField -SkipCertificateCheck:$SkipCertificateCheck
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+    $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+        -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $resolvedTimestampField `
+        -SkipCertificateCheck:$SkipCertificateCheck
+
     # PRINT A SUMMARY
 
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Rows indexed: $rowsIndexed / $totalRows"
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Column loss:  $(if ($missingColumns.Count -gt 0) { "$($missingColumns.Count) column(s) missing" } else { 'none' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Rows indexed:        $rowsIndexed / $totalRows"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Column loss:         $(if ($missingColumns.Count -gt 0) { "$($missingColumns.Count) column(s) missing" } else { 'none' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
 }
 catch {
