@@ -33,17 +33,24 @@
     same connection on later runs if it's still open. the ssh username, key,
     and ports are remembered after the first run, so later runs only need
     -File and -Tool.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\apt-hunter-output -Tool apt-hunter
+
+    apt-hunter writes a whole folder of csv files, one per event category,
+    instead of a single csv. point -Folder at that folder instead of using
+    -File, and every csv in it gets uploaded into its own index in one run.
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory, Position = 0)]
-    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
+    [Parameter(Position = 0)]
     [string]$File,
 
     [Parameter(Mandatory)]
-    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd')]
+    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter')]
     [string]$Tool,
 
+    [string]$Folder,
     [string]$IndexName,
     [string]$ElkHost,
     [int]$ElasticPort = 9200,
@@ -92,23 +99,28 @@ if (-not (Test-Path -LiteralPath $ConfigDir)) {
 }
 $LogPath = Join-Path $ConfigDir 'evtxrelay.log'
 $ElkHostPlaceholder = '<ISI_IP_ATAU_HOSTNAME_ELK_DI_SINI>'
-if (-not $IndexName) { $IndexName = "$Tool-events" }
+if (-not $IndexName -and $Tool -ne 'apt-hunter') { $IndexName = "$Tool-events" }
 
 # best guess at which column holds the date/time for each tool, used only if
-# -timestampfield isn't given by hand.
+# -timestampfield isn't given by hand. apt-hunter names this column
+# differently in each of its category csvs, so all three names it uses are
+# listed; the first one actually present in a given file wins.
 $TimestampCandidates = @{
-    hayabusa = @('Timestamp')
-    chainsaw = @('timestamp', 'Timestamp', 'Event_System_TimeCreated_SystemTime')
-    evtxecmd = @('TimeCreated')
+    hayabusa     = @('Timestamp')
+    chainsaw     = @('timestamp', 'Timestamp', 'Event_System_TimeCreated_SystemTime')
+    evtxecmd     = @('TimeCreated')
+    'apt-hunter' = @('Date and Time', 'DateTime', 'datetime')
 }
 
-# elasticsearch only auto-recognizes a few common date styles. hayabusa and
-# evtxecmd don't match, so their exact format is spelled out here. chainsaw
-# already matches on its own, so it isn't listed. without this, the date
-# column would silently be stored as plain text instead of a real date.
+# elasticsearch only auto-recognizes a few common date styles. hayabusa,
+# evtxecmd, and apt-hunter don't match, so their exact format is spelled out
+# here. chainsaw already matches on its own, so it isn't listed. without
+# this, the date column would silently be stored as plain text instead of a
+# real date.
 $TimestampFormats = @{
-    hayabusa = 'yyyy-MM-dd HH:mm:ss.SSS XXX||strict_date_optional_time||epoch_millis'
-    evtxecmd = 'yyyy-MM-dd HH:mm:ss.SSSSSSS||strict_date_optional_time||epoch_millis'
+    hayabusa     = 'yyyy-MM-dd HH:mm:ss.SSS XXX||strict_date_optional_time||epoch_millis'
+    evtxecmd     = 'yyyy-MM-dd HH:mm:ss.SSSSSSS||strict_date_optional_time||epoch_millis'
+    'apt-hunter' = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX||strict_date_optional_time||epoch_millis"
 }
 
 
@@ -669,6 +681,45 @@ function Resolve-EvtxRelayTimestampField {
     return $null
 }
 
+# works out a short category name for each apt-hunter csv by stripping
+# whatever filename prefix every file in the folder has in common (apt-hunter
+# lets you pick your own output name per run, so this can't be hardcoded)
+function Get-AptHunterCategoryMap {
+    param(
+        [Parameter(Mandatory)][string[]]$CsvPaths
+    )
+
+    $baseNames = @($CsvPaths | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) })
+
+    $prefixLength = $baseNames[0].Length
+    for ($i = 1; $i -lt $baseNames.Count; $i++) {
+        $maxCompare = [Math]::Min($prefixLength, $baseNames[$i].Length)
+        $j = 0
+        while ($j -lt $maxCompare -and $baseNames[0][$j] -ceq $baseNames[$i][$j]) { $j++ }
+        $prefixLength = $j
+    }
+    $commonPrefix = $baseNames[0].Substring(0, $prefixLength).TrimEnd('_')
+
+    $map = [ordered]@{}
+    $seen = @{}
+    for ($i = 0; $i -lt $CsvPaths.Count; $i++) {
+        $remainder = $baseNames[$i]
+        if ($commonPrefix -and $baseNames.Count -gt 1) {
+            $remainder = $baseNames[$i].Substring($commonPrefix.Length).TrimStart('_')
+        }
+        if (-not $remainder) { $remainder = $baseNames[$i] }
+        $category = $remainder.ToLowerInvariant() -replace '[\s-]+', '_'
+
+        if ($seen.ContainsKey($category)) {
+            throw "Two APT-Hunter csv files both map to category '$category': '$($seen[$category])' and '$($CsvPaths[$i])'. Rename one of the source files before re-running."
+        }
+        $seen[$category] = $CsvPaths[$i]
+        $map[$CsvPaths[$i]] = $category
+    }
+
+    return $map
+}
+
 # uploads one already-loaded csv's rows into elasticsearch, creates the
 # index and kibana data view/saved search if needed, and returns a
 # summary of what happened
@@ -793,6 +844,32 @@ function Invoke-EvtxRelayFileUpload {
 Write-EvtxRelayLog -LogPath $LogPath -Message "=== EvtxRelay start: File='$File' Tool='$Tool' ==="
 
 try {
+    if ($Tool -eq 'apt-hunter') {
+        if ($File) {
+            throw "-File isn't used with -Tool apt-hunter; pass -Folder pointing at the APT-Hunter output directory instead."
+        }
+        if (-not $Folder) {
+            throw '-Folder is required with -Tool apt-hunter (the directory containing the APT-Hunter CSV output).'
+        }
+        if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+            throw "Folder not found: '$Folder'"
+        }
+        if ($TimestampField) {
+            throw "-TimestampField isn't supported with -Tool apt-hunter, since each category file has its own differently-named date column. Omit it and let auto-detection handle each file."
+        }
+    }
+    else {
+        if ($Folder) {
+            throw "-Folder is only used with -Tool apt-hunter; pass -File pointing at the CSV instead."
+        }
+        if (-not $File) {
+            throw '-File is required.'
+        }
+        if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
+            throw "File not found: '$File'"
+        }
+    }
+
     $sshOverrides = @{}
     if ($PSBoundParameters.ContainsKey('UseSshTunnel')) { $sshOverrides.UseSshTunnel = $UseSshTunnel.IsPresent }
     if ($SshUser) { $sshOverrides.SshUser = $SshUser }
@@ -822,32 +899,96 @@ try {
     $elasticBaseUri = "https://${connectHost}:$ElasticPort"
     $kibanaBaseUri = "https://${connectHost}:$KibanaPort"
 
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Reading CSV: $File"
-    $records = @(Import-Csv -Path $File -Encoding UTF8)
-    if ($records.Count -eq 0) {
-        throw "No data rows found in '$File'."
-    }
+    if ($Tool -eq 'apt-hunter') {
+        $csvPaths = @(Get-ChildItem -LiteralPath $Folder -Filter '*.csv' -File | Select-Object -ExpandProperty FullName)
+        if ($csvPaths.Count -eq 0) {
+            throw "No .csv files found in '$Folder'."
+        }
+        $categoryMap = Get-AptHunterCategoryMap -CsvPaths $csvPaths
+        $indexPrefix = if ($IndexName) { $IndexName } else { 'apt-hunter' }
 
-    $originalHeaders = @($records[0].PSObject.Properties.Name)
-    $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
-    $sanitizedFields = @($headerMap.Values)
-    Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
+        $fileResults = New-Object System.Collections.Generic.List[object]
+        foreach ($csvPath in $csvPaths) {
+            $category = $categoryMap[$csvPath]
+            $fileIndexName = "$indexPrefix-$category"
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Processing '$csvPath' (category '$category', index '$fileIndexName') ---"
 
-    $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
-        -Candidates $TimestampCandidates[$Tool] -Override $TimestampField
-    if ($resolvedTimestampField) {
-        Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
+            try {
+                $records = @(Import-Csv -Path $csvPath -Encoding UTF8)
+                if ($records.Count -eq 0) {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$csvPath': no data rows."
+                    $fileResults.Add([PSCustomObject]@{ File = $csvPath; IndexName = $fileIndexName; Status = 'Skipped (empty)' })
+                    continue
+                }
+
+                $originalHeaders = @($records[0].PSObject.Properties.Name)
+                $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
+                $sanitizedFields = @($headerMap.Values)
+
+                $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
+                    -Candidates $TimestampCandidates[$Tool] -Override $null
+                if (-not $resolvedTimestampField) {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$csvPath': no recognizable timestamp column."
+                    $fileResults.Add([PSCustomObject]@{ File = $csvPath; IndexName = $fileIndexName; Status = 'Skipped (no timestamp)' })
+                    continue
+                }
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
+
+                $result = Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
+                    -IndexName $fileIndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
+                    -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+                    -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+
+                $fileResults.Add([PSCustomObject]@{ File = $csvPath; IndexName = $fileIndexName; Status = 'Uploaded'; RowsIndexed = $result.RowsIndexed; TotalRows = $result.TotalRows })
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$csvPath': $msg"
+                $fileResults.Add([PSCustomObject]@{ File = $csvPath; IndexName = $fileIndexName; Status = 'Failed' })
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
+        foreach ($r in $fileResults) {
+            $line = "$($r.File): $($r.Status)"
+            if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) rows into '$($r.IndexName)')" }
+            Write-EvtxRelayLog -LogPath $LogPath -Message $line
+        }
+        $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+        if ($failedCount -gt 0) {
+            throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
+        }
     }
     else {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column; saved search will not be time-sorted. Pass -TimestampField to override."
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Reading CSV: $File"
+        $records = @(Import-Csv -Path $File -Encoding UTF8)
+        if ($records.Count -eq 0) {
+            throw "No data rows found in '$File'."
+        }
+
+        $originalHeaders = @($records[0].PSObject.Properties.Name)
+        $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
+        $sanitizedFields = @($headerMap.Values)
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
+
+        $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
+            -Candidates $TimestampCandidates[$Tool] -Override $TimestampField
+        if ($resolvedTimestampField) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
+        }
+        else {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column; saved search will not be time-sorted. Pass -TimestampField to override."
+        }
+
+        Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
+            -IndexName $IndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
+            -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
     }
-
-    Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
-        -IndexName $IndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
-        -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-        -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
-
-    Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
 }
 catch {
     $detail = $_.ErrorDetails.Message
