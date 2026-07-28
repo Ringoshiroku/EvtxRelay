@@ -347,6 +347,32 @@ function Confirm-IndexWithTimestampMapping {
 }
 
 
+# VERIFICATION
+
+
+# compares the columns we uploaded against the columns elasticsearch actually
+# ended up with, and returns any that are missing
+function Test-IndexColumnCoverage {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string[]]$ExpectedFields,
+        [switch]$SkipCertificateCheck
+    )
+    $resp = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_mapping" -Method Get `
+        -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+
+    $props = $resp.$IndexName.mappings.properties
+    $mappedFields = @()
+    if ($props) { $mappedFields = @($props.PSObject.Properties.Name) }
+
+    # a column only shows up here once elasticsearch has seen a real value
+    # for it, so a missing column usually just means every row was blank
+    return @($ExpectedFields | Where-Object { $mappedFields -notcontains $_ })
+}
+
+
 # MAIN
 
 
@@ -445,10 +471,24 @@ try {
         }
     }
 
+    # DOUBLE CHECK NOTHING WAS LOST
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message 'Verifying column coverage against index mapping...'
+    $missingColumns = Test-IndexColumnCoverage -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+        -IndexName $IndexName -ExpectedFields $sanitizedFields -SkipCertificateCheck:$SkipCertificateCheck
+
+    if ($missingColumns.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Columns missing from mapping (all values may have been null/empty): $($missingColumns -join ', ')"
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "All $($sanitizedFields.Count) columns present in the index mapping. No column loss detected."
+    }
+
     # PRINT A SUMMARY
 
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
     Write-EvtxRelayLog -LogPath $LogPath -Message "Rows indexed: $rowsIndexed / $totalRows"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Column loss:  $(if ($missingColumns.Count -gt 0) { "$($missingColumns.Count) column(s) missing" } else { 'none' })"
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
 }
 catch {
