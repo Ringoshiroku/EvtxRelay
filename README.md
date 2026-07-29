@@ -68,7 +68,8 @@ instead of one CSV like the other three tools. Point `-Folder` at that
 folder instead of using `-File`, and EvtxRelay uploads every `.csv` it
 finds there in one run, each into its own index named
 `apt-hunter-<category>` (for example `apt-hunter-logon_events`,
-`apt-hunter-timesketch`). All the CSVs in an APT-Hunter output folder share
+`apt-hunter-timesketch`), or `<IndexName>-apt-hunter-<category>` if you
+passed a custom `-IndexName`. All the CSVs in an APT-Hunter output folder share
 a common filename prefix (whatever run name you gave APT-Hunter when you
 ran it), and EvtxRelay strips that shared prefix off each filename to get
 the category, so the category is independent of whatever you named the
@@ -250,7 +251,8 @@ your lab certificate is self-signed:
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
 | `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, or `apt-hunter`. Picks the target index and the timestamp field guess. |
 | `-Folder`               | If apt-hunter | none         | Path to the folder of CSVs produced by APT-Hunter. Only used with `-Tool apt-hunter`; every `.csv` in the folder is uploaded to its own index in one run. |
-| `-IndexName`            | No            | `<tool>-events` | Overrides the Elasticsearch index (and matching Kibana Data View/saved search) name, if you don't want the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming. With `-Tool apt-hunter`, this overrides the `apt-hunter` prefix instead, so each category becomes `<IndexName>-<category>` (for example `apt-hunter-logon_events`). |
+| `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
+| `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
 | `-ElkHost`              | No            | saved value  | Elasticsearch and Kibana host, or the SSH target host if using `-UseSshTunnel`. Works the same whether it's a remote VPS or a lab machine on your local network. Also updates the saved value. |
 | `-ElasticPort`          | No            | `9200`       | Local port EvtxRelay connects to for Elasticsearch. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
@@ -274,8 +276,10 @@ your lab certificate is self-signed:
    nested-object separators.
 2. Bulk indexes every row into a stable index named `<tool>-events` by
    default (`hayabusa-events`, `chainsaw-events`, or `evtxecmd-events`), or
-   whatever name you passed via `-IndexName`. This is not a date-rolling
-   index, since the data belongs to one forensic case.
+   `<IndexName>-<tool>-events` if you passed a custom `-IndexName`. This is
+   not a date-rolling index, since the data belongs to one forensic case.
+   If that index already exists, EvtxRelay warns and asks whether to delete
+   and replace it or type a different custom index name instead.
 3. Compares the CSV's columns against the index's live field mapping and
    reports, by name, any column that did not make it in.
 4. Creates a Kibana Data View and saved search for that index if they do not
