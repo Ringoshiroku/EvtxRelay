@@ -10,8 +10,10 @@
     (removes the hidden byte at the start of the file, swaps dots for
     underscores), uploads every row in batches, double checks that no column
     got dropped along the way, and sets up a kibana data view and saved
-    search if they don't already exist. running it again on the same file is
-    safe and won't create duplicates.
+    search if they don't already exist. if the target index already exists,
+    it warns and asks whether to delete and replace it or use a different
+    name instead, so you don't silently pile duplicate rows into an old
+    index.
 
     apt-hunter is different: it writes a whole folder of csv files instead of
     one, so use -Folder with -Tool apt-hunter instead of -File, and every csv
@@ -56,6 +58,7 @@ param(
 
     [string]$Folder,
     [string]$IndexName,
+    [switch]$ExactIndexName,
     [string]$ElkHost,
     [int]$ElasticPort = 9200,
     [int]$KibanaPort = 5601,
@@ -93,6 +96,29 @@ namespace EvtxRelay {
 '@
 }
 
+# builds the final index name out of the tool, the sub-part of it (an
+# apt-hunter category, or "events" for tools that don't have one), and the
+# optional custom name from -indexname, e.g. "hayabusa-events" or, with a
+# custom name of "case42", "case42-hayabusa-events". with -exact, the custom
+# name is used as-is instead of getting the tool name mixed in ("case42"), or
+# for apt-hunter, as-is plus just the category ("case42-logon_events"), since
+# apt-hunter still needs each category kept in its own index
+function Get-EvtxRelayIndexName {
+    param(
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$SubModule,
+        [string]$CustomName,
+        [switch]$Exact
+    )
+    if ($CustomName -and $Exact) {
+        if ($Tool -eq 'apt-hunter') { return "$CustomName-$SubModule" }
+        return $CustomName
+    }
+    $baseName = "$Tool-$SubModule"
+    if ($CustomName) { return "$CustomName-$baseName" }
+    return $baseName
+}
+
 
 # SETUP
 
@@ -103,7 +129,8 @@ if (-not (Test-Path -LiteralPath $ConfigDir)) {
 }
 $LogPath = Join-Path $ConfigDir 'evtxrelay.log'
 $ElkHostPlaceholder = '<ISI_IP_ATAU_HOSTNAME_ELK_DI_SINI>'
-if (-not $IndexName -and $Tool -ne 'apt-hunter') { $IndexName = "$Tool-events" }
+if (-not $IndexName -and $ExactIndexName) { throw '-ExactIndexName requires -IndexName to be given as well.' }
+if ($Tool -ne 'apt-hunter') { $IndexName = Get-EvtxRelayIndexName -Tool $Tool -SubModule 'events' -CustomName $IndexName -Exact:$ExactIndexName }
 
 # best guess at which column holds the date/time for each tool, used only if
 # -timestampfield isn't given by hand. apt-hunter names this column
@@ -454,6 +481,56 @@ function ConvertTo-BulkBody {
 # INDEX SETUP
 
 
+# checks whether the index we're about to use already exists. if it does,
+# warns and asks whether to delete and replace it or type a different custom
+# name instead, looping until the name is free or the old index gets replaced
+function Resolve-EvtxRelayAvailableIndexName {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$SubModule,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$Exact,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $candidate = $IndexName
+    while ($true) {
+        $exists = $true
+        try {
+            Invoke-ElkRequest -Uri "$ElasticBaseUri/$candidate" -Method Get `
+                -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+        }
+        catch {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+                $exists = $false
+            }
+            else {
+                throw
+            }
+        }
+
+        if (-not $exists) { return $candidate }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Index '$candidate' already exists."
+        $answer = Read-Host -Prompt "Replace it? This deletes everything already in '$candidate' (y/n)"
+        if ($answer -match '^(?i)y') {
+            Invoke-ElkRequest -Uri "$ElasticBaseUri/$candidate" -Method Delete `
+                -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Deleted existing index '$candidate'."
+            return $candidate
+        }
+
+        $newCustomName = Read-Host -Prompt 'Enter a different custom index name'
+        if ([string]::IsNullOrWhiteSpace($newCustomName)) {
+            throw 'No index name was entered. Re-run the script to try again.'
+        }
+        $candidate = Get-EvtxRelayIndexName -Tool $Tool -SubModule $SubModule -CustomName $newCustomName -Exact:$Exact
+    }
+}
+
 # creates the index if it doesn't exist yet, telling elasticsearch ahead of
 # time which column holds the date/time and what format it's in
 function Confirm-IndexWithTimestampMapping {
@@ -742,6 +819,9 @@ function Invoke-EvtxRelayFileUpload {
         [Parameter(Mandatory)]$HeaderMap,
         [Parameter(Mandatory)][string[]]$SanitizedFields,
         [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$SubModule,
+        [switch]$Exact,
         [string]$TimestampField,
         [string]$TimestampFormat,
         [Parameter(Mandatory)][string]$ElasticBaseUri,
@@ -751,6 +831,10 @@ function Invoke-EvtxRelayFileUpload {
         [switch]$SkipCertificateCheck,
         [Parameter(Mandatory)][string]$LogPath
     )
+
+    $IndexName = Resolve-EvtxRelayAvailableIndexName -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -Tool $Tool -SubModule $SubModule -IndexName $IndexName -Exact:$Exact `
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $IndexName -TimestampField $TimestampField -TimestampFormat $TimestampFormat `
@@ -918,12 +1002,11 @@ try {
             throw "No .csv files found in '$Folder'."
         }
         $categoryMap = Get-AptHunterCategoryMap -CsvPaths $csvPaths
-        $indexPrefix = if ($IndexName) { $IndexName } else { 'apt-hunter' }
 
         $fileResults = New-Object System.Collections.Generic.List[object]
         foreach ($csvPath in $csvPaths) {
             $category = $categoryMap[$csvPath]
-            $fileIndexName = "$indexPrefix-$category"
+            $fileIndexName = Get-EvtxRelayIndexName -Tool $Tool -SubModule $category -CustomName $IndexName -Exact:$ExactIndexName
             Write-EvtxRelayLog -LogPath $LogPath -Message "--- Processing '$csvPath' (category '$category', index '$fileIndexName') ---"
 
             try {
@@ -949,11 +1032,12 @@ try {
                 Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
 
                 $result = Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
-                    -IndexName $fileIndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
+                    -IndexName $fileIndexName -Tool $Tool -SubModule $category -Exact:$ExactIndexName `
+                    -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
                     -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
                     -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
-                $fileResults.Add([PSCustomObject]@{ File = $csvPath; IndexName = $fileIndexName; Status = 'Uploaded'; RowsIndexed = $result.RowsIndexed; TotalRows = $result.TotalRows })
+                $fileResults.Add([PSCustomObject]@{ File = $csvPath; IndexName = $result.IndexName; Status = 'Uploaded'; RowsIndexed = $result.RowsIndexed; TotalRows = $result.TotalRows })
             }
             catch {
                 $detail = $_.ErrorDetails.Message
@@ -997,7 +1081,8 @@ try {
         }
 
         Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
-            -IndexName $IndexName -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
+            -IndexName $IndexName -Tool $Tool -SubModule 'events' -Exact:$ExactIndexName `
+            -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
             -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
 
