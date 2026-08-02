@@ -94,8 +94,15 @@ the other four tools.
 
 If two columns in the same file both match the same concept, or a column
 name is listed under more than one concept, EvtxRelay picks one (whichever
-comes first in the file) and logs a warning naming the other column so you
-can tighten the table if the pick was wrong. If nothing in the file matches
+candidate spelling appears first for that concept in `field-aliases.json`,
+regardless of which column comes first in the file) and logs a warning
+naming the other column so you can tighten the table if the pick was wrong.
+If renaming a column to its concept's canonical name would collide with
+another column that already has that exact name (for example, a file that
+already has both `ClientIp` and `source_ip` columns, and `ClientIp` maps to
+`source_ip`), EvtxRelay stops with an error instead of silently overwriting
+one column's data with the other's; rename one of the source columns, or
+edit `field-aliases.json`, and run it again. If nothing in the file matches
 any concept at all, every column just passes through unmapped, same as an
 unrecognized column always has.
 

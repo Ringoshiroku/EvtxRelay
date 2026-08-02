@@ -826,19 +826,19 @@ function Resolve-EvtxRelayFieldConcepts {
     foreach ($concept in $AliasMap.Keys) {
         $candidates = @($AliasMap[$concept])
 
-        $matches = New-Object System.Collections.Generic.List[string]
+        $matchedFields = New-Object System.Collections.Generic.List[string]
         foreach ($candidate in $candidates) {
             foreach ($field in $allFields) {
-                if (-not $claimedBy.ContainsKey($field) -and ($field -ceq $candidate) -and ($matches -notcontains $field)) {
-                    $matches.Add($field)
+                if (-not $claimedBy.ContainsKey($field) -and ($field -ceq $candidate) -and ($matchedFields -notcontains $field)) {
+                    $matchedFields.Add($field)
                 }
             }
         }
-        if ($matches.Count -eq 0) {
+        if ($matchedFields.Count -eq 0) {
             foreach ($candidate in $candidates) {
                 foreach ($field in $allFields) {
-                    if (-not $claimedBy.ContainsKey($field) -and ($field -eq $candidate) -and ($matches -notcontains $field)) {
-                        $matches.Add($field)
+                    if (-not $claimedBy.ContainsKey($field) -and ($field -eq $candidate) -and ($matchedFields -notcontains $field)) {
+                        $matchedFields.Add($field)
                     }
                 }
             }
@@ -848,26 +848,39 @@ function Resolve-EvtxRelayFieldConcepts {
         # already claimed means the two concepts collide on that name
         foreach ($candidate in $candidates) {
             foreach ($field in $allFields) {
-                if ($claimedBy.ContainsKey($field) -and ($field -ceq $candidate -or $field -eq $candidate)) {
+                if ($claimedBy.ContainsKey($field) -and ($field -eq $candidate)) {
                     Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Concept '$concept' candidate '$candidate' also matches column '$field', already claimed by concept '$($claimedBy[$field])'. Column '$field' stays mapped to '$($claimedBy[$field])'."
                 }
             }
         }
 
-        if ($matches.Count -eq 0) { continue }
+        if ($matchedFields.Count -eq 0) { continue }
 
-        $winner = $matches[0]
+        $winner = $matchedFields[0]
         $claimedBy[$winner] = $concept
         $matchedCount++
 
-        if ($matches.Count -gt 1) {
-            $runnersUp = $matches | Select-Object -Skip 1
-            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Concept '$concept' matched more than one column ($($matches -join ', ')); using '$winner'. Column(s) $($runnersUp -join ', ') kept their own name(s). Tighten .evtxrelay/field-aliases.json if this isn't right."
+        if ($matchedFields.Count -gt 1) {
+            $runnersUp = $matchedFields | Select-Object -Skip 1
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Concept '$concept' matched more than one column ($($matchedFields -join ', ')); using '$winner'. Column(s) $($runnersUp -join ', ') kept their own name(s). Tighten .evtxrelay/field-aliases.json if this isn't right."
         }
     }
 
     if ($matchedCount -eq 0) {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message 'No columns in this file matched any concept in the field alias table; every column kept its own sanitized name.'
+    }
+
+    # renaming to a concept's canonical name can land two original columns on
+    # the same final name (one of them may not even be renamed), which would
+    # silently overwrite one column's data with the other's later on
+    $finalNameOwner = @{}
+    foreach ($originalName in @($HeaderMap.Keys)) {
+        $sanitizedField = $HeaderMap[$originalName]
+        $finalName = if ($claimedBy.ContainsKey($sanitizedField)) { $claimedBy[$sanitizedField] } else { $sanitizedField }
+        if ($finalNameOwner.ContainsKey($finalName)) {
+            throw "Concept rename collision: '$originalName' and '$($finalNameOwner[$finalName])' would both end up named '$finalName'. Rename one of the source columns, or edit .evtxrelay/field-aliases.json, before re-running."
+        }
+        $finalNameOwner[$finalName] = $originalName
     }
 
     foreach ($originalName in @($HeaderMap.Keys)) {
