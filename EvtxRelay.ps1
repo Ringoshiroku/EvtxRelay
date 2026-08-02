@@ -46,6 +46,16 @@
     apt-hunter writes a whole folder of csv files, one per event category,
     instead of a single csv. point -Folder at that folder instead of using
     -File, and every csv in it gets uploaded into its own index in one run.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -File .\unknown-tool-output.csv -Tool auto
+
+    for a csv from a tool evtxrelay doesn't know about. columns that match a
+    small set of common concepts (timestamp, source/dest ip, hostname, user
+    name, event id, process name) get renamed to a shared name, using the
+    table in .evtxrelay\field-aliases.json (created with built-in defaults
+    the first time -tool auto runs, and editable after that). every other
+    column passes through untouched, same as the other three tools.
 #>
 [CmdletBinding()]
 param(
@@ -53,7 +63,7 @@ param(
     [string]$File,
 
     [Parameter(Mandatory)]
-    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter')]
+    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto')]
     [string]$Tool,
 
     [string]$Folder,
@@ -153,6 +163,20 @@ $TimestampFormats = @{
     evtxecmd     = 'yyyy-MM-dd HH:mm:ss.SSSSSSS||strict_date_optional_time||epoch_millis'
     'apt-hunter' = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX||strict_date_optional_time||epoch_millis"
 }
+
+# for -tool auto, there's no single known format to trust up front like the
+# four known tools above. instead, sample values from the resolved
+# event_timestamp column are tested against these, in order, until one fits
+# every sample. each pairs a .net format (to test locally) with the matching
+# elasticsearch mapping format (used once a fit is found).
+$AutoTimestampFormatCandidates = @(
+    [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-ddTHH:mm:ss.ffffffK'; EsFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX||strict_date_optional_time||epoch_millis" }
+    [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-ddTHH:mm:ssK'; EsFormat = "yyyy-MM-dd'T'HH:mm:ssXXX||strict_date_optional_time||epoch_millis" }
+    [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-dd HH:mm:ss.fff K'; EsFormat = 'yyyy-MM-dd HH:mm:ss.SSS XXX||strict_date_optional_time||epoch_millis' }
+    [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-dd HH:mm:ss.fff'; EsFormat = 'yyyy-MM-dd HH:mm:ss.SSS||strict_date_optional_time||epoch_millis' }
+    [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-dd HH:mm:ss'; EsFormat = 'yyyy-MM-dd HH:mm:ss||strict_date_optional_time||epoch_millis' }
+    [PSCustomObject]@{ DotNetFormat = 'MM/dd/yyyy HH:mm:ss'; EsFormat = 'MM/dd/yyyy HH:mm:ss||strict_date_optional_time||epoch_millis' }
+)
 
 
 # LOGGING
@@ -742,6 +766,146 @@ function Confirm-KibanaSavedSearch {
 }
 
 
+# FIELD ALIAS MAPPING (-TOOL AUTO)
+
+
+# loads .evtxrelay/field-aliases.json, creating it with the built-in default
+# table on first use instead of blocking like config.json does, since there's
+# no placeholder value here that only the user could fill in
+function Get-EvtxRelayFieldAliasMap {
+    param(
+        [Parameter(Mandatory)][string]$ConfigDir,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    $aliasPath = Join-Path $ConfigDir 'field-aliases.json'
+
+    if (-not (Test-Path -LiteralPath $aliasPath)) {
+        $defaults = [ordered]@{
+            event_timestamp = @('Timestamp', 'timestamp', 'TimeCreated', 'Date and Time', 'DateTime', 'datetime', '@timestamp', 'Time')
+            source_ip       = @('SourceIp', 'SourceIP', 'Source IP', 'src_ip', 'srcip', 'ClientIp', 'Client IP')
+            dest_ip         = @('DestinationIp', 'DestIp', 'Destination IP', 'dst_ip', 'dstip', 'TargetIp', 'Target IP')
+            hostname        = @('Computer', 'ComputerName', 'Hostname', 'Host', 'Host Name', 'Machine', 'MachineName')
+            user_name       = @('User', 'UserName', 'User Name', 'TargetUserName', 'AccountName', 'Account Name')
+            event_id        = @('EventID', 'EventId', 'Event ID', 'EventCode')
+            process_name    = @('ProcessName', 'Process Name', 'Image', 'NewProcessName', 'ParentProcessName')
+        }
+        $defaults | ConvertTo-Json | Set-Content -LiteralPath $aliasPath
+        Write-EvtxRelayLog -LogPath $LogPath -Message "No field alias table found. Created one with built-in defaults at '$aliasPath'. Edit it to add or change concepts."
+    }
+
+    try {
+        $loaded = Get-Content -LiteralPath $aliasPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Field alias table at '$aliasPath' is corrupt or unreadable ($($_.Exception.Message)). Fix or delete the file, then run again; it will not be overwritten automatically."
+    }
+
+    $aliasMap = [ordered]@{}
+    foreach ($prop in $loaded.PSObject.Properties) {
+        $aliasMap[$prop.Name] = @($prop.Value)
+    }
+    return $aliasMap
+}
+
+# renames every sanitized column that matches a concept's candidate spellings
+# to that concept's canonical name, so data from different unrecognized
+# sources ends up under the same field names. exact-case match wins first, in
+# table order, then a case-insensitive pass, the same precedence rule already
+# used for timestamp detection on the four known tools
+function Resolve-EvtxRelayFieldConcepts {
+    param(
+        [Parameter(Mandatory)]$HeaderMap,
+        [Parameter(Mandatory)]$AliasMap,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $allFields = @($HeaderMap.Values)
+    $claimedBy = @{}
+    $matchedCount = 0
+
+    foreach ($concept in $AliasMap.Keys) {
+        $candidates = @($AliasMap[$concept])
+
+        $matches = New-Object System.Collections.Generic.List[string]
+        foreach ($candidate in $candidates) {
+            foreach ($field in $allFields) {
+                if (-not $claimedBy.ContainsKey($field) -and ($field -ceq $candidate) -and ($matches -notcontains $field)) {
+                    $matches.Add($field)
+                }
+            }
+        }
+        if ($matches.Count -eq 0) {
+            foreach ($candidate in $candidates) {
+                foreach ($field in $allFields) {
+                    if (-not $claimedBy.ContainsKey($field) -and ($field -eq $candidate) -and ($matches -notcontains $field)) {
+                        $matches.Add($field)
+                    }
+                }
+            }
+        }
+
+        # a candidate spelling that only matches a field another concept
+        # already claimed means the two concepts collide on that name
+        foreach ($candidate in $candidates) {
+            foreach ($field in $allFields) {
+                if ($claimedBy.ContainsKey($field) -and ($field -ceq $candidate -or $field -eq $candidate)) {
+                    Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Concept '$concept' candidate '$candidate' also matches column '$field', already claimed by concept '$($claimedBy[$field])'. Column '$field' stays mapped to '$($claimedBy[$field])'."
+                }
+            }
+        }
+
+        if ($matches.Count -eq 0) { continue }
+
+        $winner = $matches[0]
+        $claimedBy[$winner] = $concept
+        $matchedCount++
+
+        if ($matches.Count -gt 1) {
+            $runnersUp = $matches | Select-Object -Skip 1
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Concept '$concept' matched more than one column ($($matches -join ', ')); using '$winner'. Column(s) $($runnersUp -join ', ') kept their own name(s). Tighten .evtxrelay/field-aliases.json if this isn't right."
+        }
+    }
+
+    if ($matchedCount -eq 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message 'No columns in this file matched any concept in the field alias table; every column kept its own sanitized name.'
+    }
+
+    foreach ($originalName in @($HeaderMap.Keys)) {
+        $sanitizedField = $HeaderMap[$originalName]
+        if ($claimedBy.ContainsKey($sanitizedField)) {
+            $HeaderMap[$originalName] = $claimedBy[$sanitizedField]
+        }
+    }
+
+    return $HeaderMap
+}
+
+# tests sample values from the resolved timestamp column against a curated
+# list of common date formats and returns the elasticsearch mapping string
+# for the first one that fits every sample, or $null if none do
+function Resolve-EvtxRelayTimestampFormat {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$SampleValues,
+        [Parameter(Mandatory)][array]$FormatCandidates
+    )
+    $samples = @($SampleValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 20)
+    if ($samples.Count -eq 0) { return $null }
+
+    foreach ($candidate in $FormatCandidates) {
+        $allParse = $true
+        foreach ($sample in $samples) {
+            $parsed = [datetime]::MinValue
+            $ok = [datetime]::TryParseExact(
+                $sample, $candidate.DotNetFormat, [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None, [ref]$parsed)
+            if (-not $ok) { $allParse = $false; break }
+        }
+        if ($allParse) { return $candidate.EsFormat }
+    }
+    return $null
+}
+
+
 # PER-FILE PROCESSING
 
 
@@ -1071,8 +1235,19 @@ try {
         $sanitizedFields = @($headerMap.Values)
         Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
 
+        $timestampCandidatesForTool = $TimestampCandidates[$Tool]
+        $timestampFormatForTool = $TimestampFormats[$Tool]
+
+        if ($Tool -eq 'auto') {
+            $aliasMap = Get-EvtxRelayFieldAliasMap -ConfigDir $ConfigDir -LogPath $LogPath
+            $headerMap = Resolve-EvtxRelayFieldConcepts -HeaderMap $headerMap -AliasMap $aliasMap -LogPath $LogPath
+            $sanitizedFields = @($headerMap.Values)
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Columns after concept mapping: $($sanitizedFields -join ', ')"
+            $timestampCandidatesForTool = @('event_timestamp')
+        }
+
         $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
-            -Candidates $TimestampCandidates[$Tool] -Override $TimestampField
+            -Candidates $timestampCandidatesForTool -Override $TimestampField
         if ($resolvedTimestampField) {
             Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
         }
@@ -1080,9 +1255,21 @@ try {
             Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column; saved search will not be time-sorted. Pass -TimestampField to override."
         }
 
+        if ($Tool -eq 'auto' -and $resolvedTimestampField -eq 'event_timestamp') {
+            $originalTimestampColumn = @($headerMap.Keys | Where-Object { $headerMap[$_] -eq 'event_timestamp' })[0]
+            $sampleValues = @($records | Select-Object -ExpandProperty $originalTimestampColumn)
+            $timestampFormatForTool = Resolve-EvtxRelayTimestampFormat -SampleValues $sampleValues -FormatCandidates $AutoTimestampFormatCandidates
+            if ($timestampFormatForTool) {
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Detected date format for 'event_timestamp': $timestampFormatForTool"
+            }
+            else {
+                Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not confidently detect a date format for 'event_timestamp' from sample values; index will be created without an explicit date mapping."
+            }
+        }
+
         Invoke-EvtxRelayFileUpload -Records $records -HeaderMap $headerMap -SanitizedFields $sanitizedFields `
             -IndexName $IndexName -Tool $Tool -SubModule 'events' -Exact:$ExactIndexName `
-            -TimestampField $resolvedTimestampField -TimestampFormat $TimestampFormats[$Tool] `
+            -TimestampField $resolvedTimestampField -TimestampFormat $timestampFormatForTool `
             -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
 
