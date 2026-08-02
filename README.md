@@ -8,7 +8,11 @@ column was lost along the way, and leaves you with a ready to open Kibana
 saved search. It has no server side component and does not wrap the parser
 tools themselves: you run Hayabusa, Chainsaw, EvtxECmd, or APT-Hunter
 yourself, then hand the resulting CSV (or, for APT-Hunter, its output
-folder) to EvtxRelay.
+folder) to EvtxRelay. A CSV from some other tool can still be uploaded with
+`-Tool auto`, which renames a small set of common columns (timestamp,
+source/dest IP, hostname, user name, event ID, process name) to shared
+names so data from different unfamiliar sources ends up comparable in
+Kibana.
 
 This works the same way whether Elasticsearch/Kibana live on a remote VPS
 or on a lab machine on your own local network (same office/lab WiFi, for
@@ -54,11 +58,54 @@ and tell it which schema to expect with `-Tool`:
 .\EvtxRelay.ps1 -File .\path.csv -Tool chainsaw
 .\EvtxRelay.ps1 -File .\htb-trojan-system.csv -Tool evtxecmd
 .\EvtxRelay.ps1 -Folder .\apt-hunter-output -Tool apt-hunter
+.\EvtxRelay.ps1 -File .\unknown-tool-output.csv -Tool auto
 ```
 
-`-Tool` only accepts `hayabusa`, `chainsaw`, `evtxecmd`, or `apt-hunter`. It
-is never guessed from the CSV headers, since each tool's schema can change
-across versions and being explicit is safer than guessing.
+`-Tool` accepts `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, or `auto`.
+Other than `auto`, it is never guessed from the CSV headers, since each
+tool's schema can change across versions and being explicit is safer than
+guessing.
+
+### `-Tool auto`: for a CSV from a tool EvtxRelay doesn't know about
+
+`-Tool auto` works like `-Tool hayabusa`/`chainsaw`/`evtxecmd` (one CSV via
+`-File`), but instead of expecting a specific schema, it renames whichever
+columns match a small set of common concepts to a shared name, using the
+table in `.evtxrelay\field-aliases.json`:
+
+| Concept | Renamed to |
+|---|---|
+| timestamp | `event_timestamp` |
+| source IP | `source_ip` |
+| destination IP | `dest_ip` |
+| hostname | `hostname` |
+| user name | `user_name` |
+| event ID | `event_id` |
+| process name | `process_name` |
+
+The first time `-Tool auto` runs, `field-aliases.json` is created with a
+built-in default list of spellings for each concept (for example `source_ip`
+matches `SourceIp`, `SourceIP`, `Source IP`, `src_ip`, `ClientIp`, and a few
+more). Open the file to see or edit the full list; it's a plain JSON object
+of concept name to an ordered list of candidate column spellings, and you
+can add more concepts or spellings by hand. A column that doesn't match
+anything keeps its own (sanitized) name, exactly like every column does for
+the other four tools.
+
+If two columns in the same file both match the same concept, or a column
+name is listed under more than one concept, EvtxRelay picks one (whichever
+comes first in the file) and logs a warning naming the other column so you
+can tighten the table if the pick was wrong. If nothing in the file matches
+any concept at all, every column just passes through unmapped, same as an
+unrecognized column always has.
+
+Once a column is renamed to `event_timestamp`, EvtxRelay samples its values
+and tries a curated list of common date formats against them to build a
+proper Elasticsearch date mapping, the same way it already has an explicit
+format hardcoded for hayabusa/evtxecmd/apt-hunter. If none of the curated
+formats fit, the index is created without one, same as when no timestamp
+column can be found at all: the data still uploads, it just won't be
+time-sorted in the saved search.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
 
@@ -249,7 +296,7 @@ your lab certificate is self-signed:
 | Parameter              | Required     | Default      | Purpose |
 |------------------------|---------------|--------------|---------|
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
-| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, or `apt-hunter`. Picks the target index and the timestamp field guess. |
+| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, or `auto`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. |
 | `-Folder`               | If apt-hunter | none         | Path to the folder of CSVs produced by APT-Hunter. Only used with `-Tool apt-hunter`; every `.csv` in the folder is uploaded to its own index in one run. |
 | `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
 | `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
@@ -273,7 +320,8 @@ your lab certificate is self-signed:
    file to mark its text encoding -- harmless to the file itself, but it
    corrupts the first column's name if left in), and replaces any dots in
    column names with underscores, since Elasticsearch treats dots as
-   nested-object separators.
+   nested-object separators. With `-Tool auto`, columns matching a known
+   concept are then renamed to their shared name, as described above.
 2. Bulk indexes every row into a stable index named `<tool>-events` by
    default (`hayabusa-events`, `chainsaw-events`, or `evtxecmd-events`), or
    `<IndexName>-<tool>-events` if you passed a custom `-IndexName`. This is
