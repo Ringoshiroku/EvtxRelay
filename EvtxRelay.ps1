@@ -918,6 +918,57 @@ function Resolve-EvtxRelayTimestampFormat {
     return $null
 }
 
+# last-resort fallback for -tool auto when field-aliases.json matched nothing at all: sends
+# a raw sample of the file to elasticsearch's own structure finder and asks it to guess the
+# timestamp column and its date format. never throws; any failure just means no fallback was
+# found and the caller proceeds exactly like it already does when nothing can be detected
+function Resolve-EvtxRelayTimestampViaFindStructure {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)]$HeaderMap,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    # a sample of up to 1000 raw lines (header plus up to 999 data rows) is plenty for the
+    # structure finder to work with, and keeps a huge csv from turning into a huge request.
+    # shorter files just send everything, since get-content stops at end of file on its own
+    $sampleLines = @(Get-Content -LiteralPath $File -TotalCount 1000)
+    $sampleBody = $sampleLines -join "`n"
+
+    try {
+        $response = Invoke-ElkRequest -Uri "$ElasticBaseUri/_ml/find_file_structure" -Method Post `
+            -Headers $AuthHeaders -Body $sampleBody -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+    }
+    catch {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder could not analyze this file ($($_.Exception.Message)); continuing without it."
+        return $null
+    }
+
+    $timestampField = $response.timestamp_field
+    if (-not $timestampField -or -not $HeaderMap.Contains($timestampField)) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder did not find a usable timestamp column in this file; continuing without it."
+        return $null
+    }
+
+    $esFormat = $response.mappings.$timestampField.format
+    if (-not $esFormat) {
+        $esFormat = $response.java_timestamp_formats | Select-Object -First 1
+    }
+    if (-not $esFormat) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder found column '$timestampField' but no usable date format for it; continuing without it."
+        return $null
+    }
+
+    return [PSCustomObject]@{
+        OriginalColumnName = $timestampField
+        EsFormat            = "$esFormat||strict_date_optional_time||epoch_millis"
+    }
+}
+
 
 # PER-FILE PROCESSING
 
@@ -1261,6 +1312,23 @@ try {
 
         $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
             -Candidates $timestampCandidatesForTool -Override $TimestampField
+
+        # only worth asking elasticsearch to guess when the alias table found nothing at all.
+        # if it already found a column, trust that pick instead of risking a second opinion
+        # that names a different column, which would have no clean way to be resolved
+        $structureFinderResult = $null
+        if (-not $resolvedTimestampField -and $Tool -eq 'auto') {
+            $structureFinderResult = Resolve-EvtxRelayTimestampViaFindStructure -File $File -HeaderMap $headerMap `
+                -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+            if ($structureFinderResult) {
+                $headerMap[$structureFinderResult.OriginalColumnName] = 'event_timestamp'
+                $sanitizedFields = @($headerMap.Values)
+                $resolvedTimestampField = 'event_timestamp'
+                $timestampFormatForTool = $structureFinderResult.EsFormat
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Field alias table had no timestamp match; Elasticsearch's structure finder detected '$($structureFinderResult.OriginalColumnName)' as the timestamp column."
+            }
+        }
+
         if ($resolvedTimestampField) {
             Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
         }
@@ -1268,7 +1336,7 @@ try {
             Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column; saved search will not be time-sorted. Pass -TimestampField to override."
         }
 
-        if ($Tool -eq 'auto' -and $resolvedTimestampField -eq 'event_timestamp') {
+        if ($Tool -eq 'auto' -and $resolvedTimestampField -eq 'event_timestamp' -and -not $structureFinderResult) {
             $originalTimestampColumn = @($headerMap.Keys | Where-Object { $headerMap[$_] -eq 'event_timestamp' })[0]
             $sampleValues = @($records | Select-Object -ExpandProperty $originalTimestampColumn)
             $timestampFormatForTool = Resolve-EvtxRelayTimestampFormat -SampleValues $sampleValues -FormatCandidates $AutoTimestampFormatCandidates
