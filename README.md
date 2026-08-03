@@ -114,6 +114,15 @@ formats fit, the index is created without one, same as when no timestamp
 column can be found at all: the data still uploads, it just won't be
 time-sorted in the saved search.
 
+If nothing in `field-aliases.json` matched any column at all, EvtxRelay
+makes one more attempt before giving up on time-sorting: it sends a sample
+of the file to Elasticsearch's own structure finder, which tries to spot a
+timestamp-looking column and its date format on its own, independent of
+the alias table. If that succeeds, the column is renamed to
+`event_timestamp` just like a normal alias match, and the run continues as
+usual. If Elasticsearch can't find one either, or can't be reached, the
+run still succeeds without one, same as it always has.
+
 ### APT-Hunter is different: a folder of CSVs, not one file
 
 APT-Hunter writes one CSV per event category into a single output folder
