@@ -944,7 +944,9 @@ function Resolve-EvtxRelayTimestampViaFindStructure {
             -SkipCertificateCheck:$SkipCertificateCheck
     }
     catch {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder could not analyze this file ($($_.Exception.Message)); continuing without it."
+        $detail = $_.ErrorDetails.Message
+        $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder could not analyze this file ($msg); continuing without it."
         return $null
     }
 
@@ -1321,6 +1323,12 @@ try {
             $structureFinderResult = Resolve-EvtxRelayTimestampViaFindStructure -File $File -HeaderMap $headerMap `
                 -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
             if ($structureFinderResult) {
+                # don't let the structure finder's pick steal 'event_timestamp' out from under
+                # a column the alias table already claimed that name for
+                $existingOwner = @($headerMap.Keys | Where-Object { $headerMap[$_] -eq 'event_timestamp' })
+                if ($existingOwner.Count -gt 0) {
+                    throw "Structure finder collision: '$($structureFinderResult.OriginalColumnName)' and '$($existingOwner[0])' would both end up named 'event_timestamp'. Rename one of the source columns, or edit .evtxrelay/field-aliases.json, before re-running."
+                }
                 $headerMap[$structureFinderResult.OriginalColumnName] = 'event_timestamp'
                 $sanitizedFields = @($headerMap.Values)
                 $resolvedTimestampField = 'event_timestamp'
