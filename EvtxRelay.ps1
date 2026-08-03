@@ -956,9 +956,21 @@ function Resolve-EvtxRelayTimestampViaFindStructure {
         return $null
     }
 
-    $esFormat = $response.mappings.$timestampField.format
+    $esFormat = $response.mappings.properties.$timestampField.format
     if (-not $esFormat) {
-        $esFormat = $response.java_timestamp_formats | Select-Object -First 1
+        # java_timestamp_formats can hold special ingest-processor names instead of a real
+        # mapping format string. only translate the ones with a known mapping-legal equivalent;
+        # anything else (a raw java.time pattern, or a name like tai64n with no equivalent) isn't
+        # safe to hand to elasticsearch's date mapping, so it's treated as not found
+        $specialFormatMap = @{
+            ISO8601 = 'strict_date_optional_time'
+            UNIX_MS = 'epoch_millis'
+            UNIX    = 'epoch_second'
+        }
+        $guessedFormat = $response.java_timestamp_formats | Select-Object -First 1
+        if ($guessedFormat -and $specialFormatMap.Contains($guessedFormat)) {
+            $esFormat = $specialFormatMap[$guessedFormat]
+        }
     }
     if (-not $esFormat) {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder found column '$timestampField' but no usable date format for it; continuing without it."
@@ -1333,7 +1345,7 @@ try {
                 $sanitizedFields = @($headerMap.Values)
                 $resolvedTimestampField = 'event_timestamp'
                 $timestampFormatForTool = $structureFinderResult.EsFormat
-                Write-EvtxRelayLog -LogPath $LogPath -Message "Field alias table had no timestamp match; Elasticsearch's structure finder detected '$($structureFinderResult.OriginalColumnName)' as the timestamp column."
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Field alias table had no timestamp match; Elasticsearch's structure finder detected '$($structureFinderResult.OriginalColumnName)' as the timestamp column, using format $($structureFinderResult.EsFormat)."
             }
         }
 

@@ -114,7 +114,8 @@ formats fit, the index is created without one, same as when no timestamp
 column can be found at all: the data still uploads, it just won't be
 time-sorted in the saved search.
 
-If nothing in `field-aliases.json` matched any column at all, EvtxRelay
+If nothing in `field-aliases.json` matched a timestamp column (other
+concepts like hostname or username can still have matched fine), EvtxRelay
 makes one more attempt before giving up on time-sorting: it sends a sample
 of the file to Elasticsearch's own structure finder, which tries to spot a
 timestamp-looking column and its date format on its own, independent of
