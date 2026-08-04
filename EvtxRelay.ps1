@@ -1603,6 +1603,97 @@ function Invoke-EvtxRelayCsvBatchUpload {
     return [PSCustomObject]@{ TotalRows = $totalRows; RowsIndexed = $rowsIndexed; MissingColumns = $missingColumns }
 }
 
+# uploads one already-structure-detected log file's lines into a shared index that folder mode
+# already created, tagging every line with which file it came from. unlike -tool auto's shared
+# index, -tool log's shared index always uses a fixed @timestamp mapping (set once, in folder
+# mode's index setup call), so this function only needs to handle each file's own ingest
+# pipeline, not the index's date mapping
+function Invoke-EvtxRelayLogBatchUpload {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines,
+        [Parameter(Mandatory)][string]$SourceFile,
+        [Parameter(Mandatory)][string]$IndexName,
+        $StructureResult,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    # each file gets its own pipeline, since elasticsearch pipelines are chosen per bulk request
+    # (?pipeline=name) rather than fixed to an index, so different files in the same folder can
+    # use different grok patterns without conflicting. a plain put always either creates a
+    # pipeline fresh or harmlessly overwrites it, same as the single-file log path already relies
+    # on, and this loop only ever uses the pipeline it just created for its own file's uploads, so
+    # a name collision between two files across loop iterations is harmless
+    $pipelineName = $null
+    if ($StructureResult) {
+        # slugs the whole filename, not just its base name, so "auth.log" and "auth.log.1"
+        # (get-filenamewithoutextension would strip only the last extension, turning those into
+        # the ambiguous "auth" and "auth.log") get distinct, recognizable pipeline names
+        $fileSlug = ($SourceFile -replace '[^a-zA-Z0-9]+', '-').ToLowerInvariant().Trim('-')
+        $pipelineName = "$IndexName-$fileSlug-pipeline"
+        $pipelineBody = @{
+            description = "EvtxRelay log pipeline for '$IndexName' (source file '$SourceFile')"
+            processors  = $StructureResult.Processors
+            on_failure  = @(
+                @{ set = @{ field = 'grok_parse_failed'; value = $true } }
+            )
+        }
+        Invoke-ElkRequest -Uri "$ElasticBaseUri/_ingest/pipeline/$pipelineName" -Method Put `
+            -Headers $AuthHeaders -Body ($pipelineBody | ConvertTo-Json -Depth 10) -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created ingest pipeline '$pipelineName' for '$SourceFile' (detected via column '$($StructureResult.TimestampFieldRaw)')."
+    }
+
+    $totalLines = $Lines.Count
+    $bulkErrors = New-Object System.Collections.Generic.List[object]
+    $bulkUri = "$ElasticBaseUri/$IndexName/_bulk"
+    if ($pipelineName) { $bulkUri += "?pipeline=$pipelineName" }
+
+    for ($start = 0; $start -lt $totalLines; $start += $BatchSize) {
+        $end = [Math]::Min($start + $BatchSize, $totalLines) - 1
+        $batch = @(foreach ($line in $Lines[$start..$end]) { [PSCustomObject]@{ message = $line; source_file = $SourceFile } })
+        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $batch
+
+        $response = Invoke-ElkRequest -Uri $bulkUri -Method Post `
+            -Headers $AuthHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        if ($response.errors) {
+            for ($j = 0; $j -lt $response.items.Count; $j++) {
+                $item = $response.items[$j].index
+                if ($item.error) {
+                    $detailParts = New-Object System.Collections.Generic.List[string]
+                    $errNode = $item.error
+                    while ($errNode) {
+                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
+                        $errNode = $errNode.caused_by
+                    }
+                    $bulkErrors.Add([PSCustomObject]@{
+                        Row    = $start + $j + 1
+                        Type   = $item.error.type
+                        Reason = ($detailParts -join ' <- caused by: ')
+                    })
+                }
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed lines $($start + 1)-$($end + 1) of $totalLines from '$SourceFile' into '$IndexName'."
+    }
+
+    $rowsIndexed = $totalLines - $bulkErrors.Count
+    if ($bulkErrors.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) line(s) from '$SourceFile' failed to index:"
+        foreach ($e in $bulkErrors) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Line $($e.Row): $($e.Reason)"
+        }
+    }
+
+    return [PSCustomObject]@{ TotalLines = $totalLines; RowsIndexed = $rowsIndexed }
+}
+
 
 # MAIN
 
@@ -1842,7 +1933,76 @@ try {
         }
     }
     elseif ($Tool -eq 'log' -and $Folder) {
-        throw "-Folder isn't wired up yet for -Tool log; use -File instead."
+        $excludedExtensions = @('.gz', '.zip', '.bz2')
+        $logPaths = @(Get-ChildItem -LiteralPath $Folder -File | Where-Object { $excludedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Select-Object -ExpandProperty FullName)
+        if ($logPaths.Count -eq 0) {
+            throw "No usable files found in '$Folder' (compressed files like .gz/.zip/.bz2 are skipped, not decompressed)."
+        }
+
+        $indexSetup = Resolve-EvtxRelayBatchIndexSetup -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+            -Tool $Tool -IndexName $IndexName -Exact:$ExactIndexName `
+            -TimestampField '@timestamp' -TimestampFormat 'strict_date_optional_time||epoch_millis' `
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+        $IndexName = $indexSetup.IndexName
+
+        $fileResults = New-Object System.Collections.Generic.List[object]
+        foreach ($sourceLogPath in $logPaths) {
+            # named $sourceLogPath, not $logPath: powershell variable names are case-insensitive,
+            # so a loop variable called $logPath would be the exact same variable as the script's
+            # own $LogPath (the execution log file), silently overwriting it with the current
+            # source file's path on every iteration
+            $sourceFile = Split-Path -Leaf $sourceLogPath
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Processing '$sourceLogPath' ---"
+            try {
+                $lines = @(Get-Content -LiteralPath $sourceLogPath -Encoding UTF8)
+                if ($lines.Count -eq 0) {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$sourceLogPath': no lines."
+                    $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Skipped (empty)' })
+                    continue
+                }
+
+                $structureResult = Resolve-EvtxRelayLogStructure -File $sourceLogPath `
+                    -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                    -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+
+                $uploadResult = Invoke-EvtxRelayLogBatchUpload -Lines $lines -SourceFile $sourceFile -IndexName $IndexName `
+                    -StructureResult $structureResult `
+                    -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                    -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalLines })
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$sourceLogPath': $msg"
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+        $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -TimestampField '@timestamp' -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+        $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -DataViewId $dataView.Id -TimestampField '@timestamp' `
+            -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
+        foreach ($r in $fileResults) {
+            $line = "$($r.File): $($r.Status)"
+            if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) lines into '$IndexName')" }
+            Write-EvtxRelayLog -LogPath $LogPath -Message $line
+        }
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+
+        $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+        if ($failedCount -gt 0) {
+            throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
+        }
     }
     elseif ($Tool -eq 'log') {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Reading log file: $File"
