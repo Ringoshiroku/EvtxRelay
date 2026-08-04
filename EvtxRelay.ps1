@@ -483,16 +483,19 @@ function Get-SanitizedHeaderMap {
     return $map
 }
 
-# rebuilds one row of data using the cleaned up column names
+# rebuilds one row of data using the cleaned up column names. -sourcefile is only passed in
+# folder batch mode, where several files share one index and a tag is needed to tell them apart
 function ConvertTo-SanitizedRecord {
     param(
         [Parameter(Mandatory)]$Record,
-        [Parameter(Mandatory)]$HeaderMap
+        [Parameter(Mandatory)]$HeaderMap,
+        [string]$SourceFile
     )
     $out = [ordered]@{}
     foreach ($original in $HeaderMap.Keys) {
         $out[$HeaderMap[$original]] = $Record.$original
     }
+    if ($SourceFile) { $out['source_file'] = $SourceFile }
     return $out
 }
 
@@ -1416,6 +1419,191 @@ function Invoke-EvtxRelayLogUpload {
 }
 
 
+# FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG)
+
+
+# runs one -tool auto csv file through the same detection a single-file run would do (header
+# sanitizing, field-alias concept mapping, structure-finder fallback, per-file date format
+# detection), without touching the index or uploading anything. folder mode calls this once per
+# file so every file can be detected independently before the shared index is created
+function Resolve-EvtxRelayCsvFileDetection {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)]$AliasMap,
+        [Parameter(Mandatory)][array]$AutoTimestampFormatCandidates,
+        [string]$Override,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $records = @(Import-Csv -Path $File -Encoding UTF8)
+    if ($records.Count -eq 0) {
+        throw "No data rows found in '$File'."
+    }
+
+    $originalHeaders = @($records[0].PSObject.Properties.Name)
+    $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
+    $headerMap = Resolve-EvtxRelayFieldConcepts -HeaderMap $headerMap -AliasMap $AliasMap -LogPath $LogPath
+    $sanitizedFields = @($headerMap.Values)
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
+
+    $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
+        -Candidates @('event_timestamp') -Override $Override
+
+    # only worth asking elasticsearch to guess when nothing already found a timestamp column,
+    # same rule the single-file -tool auto path uses
+    $structureFinderResult = $null
+    if (-not $resolvedTimestampField) {
+        $structureFinderResult = Resolve-EvtxRelayTimestampViaFindStructure -File $File -HeaderMap $headerMap `
+            -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+        if ($structureFinderResult) {
+            $existingOwner = @($headerMap.Keys | Where-Object { $headerMap[$_] -eq 'event_timestamp' })
+            if ($existingOwner.Count -gt 0) {
+                throw "Structure finder collision: '$($structureFinderResult.OriginalColumnName)' and '$($existingOwner[0])' would both end up named 'event_timestamp'. Rename one of the source columns, or edit .evtxrelay/field-aliases.json, before re-running."
+            }
+            $headerMap[$structureFinderResult.OriginalColumnName] = 'event_timestamp'
+            $sanitizedFields = @($headerMap.Values)
+            $resolvedTimestampField = 'event_timestamp'
+        }
+    }
+
+    $timestampFormat = $null
+    if ($resolvedTimestampField) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$resolvedTimestampField' as the timestamp field for sorting."
+        if ($structureFinderResult) {
+            $timestampFormat = $structureFinderResult.EsFormat
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Elasticsearch's structure finder detected '$($structureFinderResult.OriginalColumnName)' as the timestamp column, using format $($structureFinderResult.EsFormat)."
+        }
+        # a format is only worth detecting from sample values for the alias table's own
+        # event_timestamp concept. a manual -timestampfield override could name any column, and
+        # there's no reliable way to guess a format for an arbitrary one
+        elseif ($resolvedTimestampField -eq 'event_timestamp') {
+            $originalTimestampColumn = @($headerMap.Keys | Where-Object { $headerMap[$_] -eq 'event_timestamp' })[0]
+            $sampleValues = @($records | Select-Object -ExpandProperty $originalTimestampColumn)
+            $timestampFormat = Resolve-EvtxRelayTimestampFormat -SampleValues $sampleValues -FormatCandidates $AutoTimestampFormatCandidates
+            if ($timestampFormat) {
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Detected date format for 'event_timestamp': $timestampFormat"
+            }
+            else {
+                Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not confidently detect a date format for 'event_timestamp' from this file's sample values; its rows will rely on whatever date mapping the shared index ends up with, if any."
+            }
+        }
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column in this file; its rows will not be time-sorted."
+    }
+
+    return [PSCustomObject]@{
+        Records         = $records
+        HeaderMap       = $headerMap
+        SanitizedFields = $sanitizedFields
+        TimestampField  = $resolvedTimestampField
+        TimestampFormat = $timestampFormat
+    }
+}
+
+# resolves and creates the one shared index a folder batch run uses, same as
+# resolve-evtxrelayavailableindexname + confirm-indexwithtimestampmapping already do for a single
+# file, just factored out so folder mode can call it once instead of once per file
+function Resolve-EvtxRelayBatchIndexSetup {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$Exact,
+        [string]$TimestampField,
+        [string]$TimestampFormat,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $resolvedIndexName = Resolve-EvtxRelayAvailableIndexName -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -Tool $Tool -SubModule 'events' -IndexName $IndexName -Exact:$Exact `
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+
+    $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $resolvedIndexName -TimestampField $TimestampField -TimestampFormat $TimestampFormat `
+        -SkipCertificateCheck:$SkipCertificateCheck
+    if ($indexCreated -and $TimestampField -and $TimestampFormat) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$resolvedIndexName' with an explicit date mapping for '$TimestampField'."
+    }
+
+    return [PSCustomObject]@{ IndexName = $resolvedIndexName; IndexCreated = $indexCreated }
+}
+
+# uploads one already-detected csv file's rows into a shared index that folder mode already
+# created, tagging every row with which file it came from
+function Invoke-EvtxRelayCsvBatchUpload {
+    param(
+        [Parameter(Mandatory)][array]$Records,
+        [Parameter(Mandatory)]$HeaderMap,
+        [Parameter(Mandatory)][string[]]$SanitizedFields,
+        [Parameter(Mandatory)][string]$SourceFile,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $totalRows = $Records.Count
+    $bulkErrors = New-Object System.Collections.Generic.List[object]
+
+    for ($start = 0; $start -lt $totalRows; $start += $BatchSize) {
+        $end = [Math]::Min($start + $BatchSize, $totalRows) - 1
+        $batch = $Records[$start..$end]
+        $sanitizedBatch = @(foreach ($r in $batch) { ConvertTo-SanitizedRecord -Record $r -HeaderMap $HeaderMap -SourceFile $SourceFile })
+        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $sanitizedBatch
+
+        $response = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_bulk" -Method Post `
+            -Headers $AuthHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        if ($response.errors) {
+            for ($j = 0; $j -lt $response.items.Count; $j++) {
+                $item = $response.items[$j].index
+                if ($item.error) {
+                    $detailParts = New-Object System.Collections.Generic.List[string]
+                    $errNode = $item.error
+                    while ($errNode) {
+                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
+                        $errNode = $errNode.caused_by
+                    }
+                    $bulkErrors.Add([PSCustomObject]@{
+                        Row    = $start + $j + 1
+                        Type   = $item.error.type
+                        Reason = ($detailParts -join ' <- caused by: ')
+                    })
+                }
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed rows $($start + 1)-$($end + 1) of $totalRows from '$SourceFile' into '$IndexName'."
+    }
+
+    $rowsIndexed = $totalRows - $bulkErrors.Count
+    if ($bulkErrors.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) row(s) from '$SourceFile' failed to index:"
+        foreach ($e in $bulkErrors) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Row $($e.Row): $($e.Reason)"
+        }
+    }
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Verifying column coverage for '$SourceFile' against the shared index mapping..."
+    $missingColumns = Test-IndexColumnCoverage -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -ExpectedFields $SanitizedFields -SkipCertificateCheck:$SkipCertificateCheck
+    if ($missingColumns.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Columns from '$SourceFile' missing from the mapping (all its values may have been null/empty, or another file just hasn't populated them yet): $($missingColumns -join ', ')"
+    }
+
+    return [PSCustomObject]@{ TotalRows = $totalRows; RowsIndexed = $rowsIndexed; MissingColumns = $missingColumns }
+}
+
+
 # MAIN
 
 
@@ -1436,18 +1624,32 @@ try {
             throw "-TimestampField isn't supported with -Tool apt-hunter, since each category file has its own differently-named date column. Omit it and let auto-detection handle each file."
         }
     }
+    elseif ($Tool -eq 'auto' -or $Tool -eq 'log') {
+        if ($File -and $Folder) {
+            throw '-File and -Folder cannot both be given; pass one or the other.'
+        }
+        if (-not $File -and -not $Folder) {
+            throw '-File or -Folder is required.'
+        }
+        if ($File -and -not (Test-Path -LiteralPath $File -PathType Leaf)) {
+            throw "File not found: '$File'"
+        }
+        if ($Folder -and -not (Test-Path -LiteralPath $Folder -PathType Container)) {
+            throw "Folder not found: '$Folder'"
+        }
+        if ($Tool -eq 'log' -and $TimestampField) {
+            throw "-TimestampField isn't supported with -Tool log; the timestamp always comes from Elasticsearch's structure finder as '@timestamp'."
+        }
+    }
     else {
         if ($Folder) {
-            throw "-Folder is only used with -Tool apt-hunter; pass -File pointing at the CSV instead."
+            throw "-Folder is only used with -Tool apt-hunter, auto, or log; pass -File pointing at the CSV instead."
         }
         if (-not $File) {
             throw '-File is required.'
         }
         if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
             throw "File not found: '$File'"
-        }
-        if ($Tool -eq 'log' -and $TimestampField) {
-            throw "-TimestampField isn't supported with -Tool log; the timestamp always comes from Elasticsearch's structure finder as '@timestamp'."
         }
     }
 
@@ -1537,6 +1739,102 @@ try {
             if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) rows into '$($r.IndexName)')" }
             Write-EvtxRelayLog -LogPath $LogPath -Message $line
         }
+        $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+        if ($failedCount -gt 0) {
+            throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
+        }
+    }
+    elseif ($Tool -eq 'auto' -and $Folder) {
+        $csvPaths = @(Get-ChildItem -LiteralPath $Folder -Filter '*.csv' -File | Select-Object -ExpandProperty FullName)
+        if ($csvPaths.Count -eq 0) {
+            throw "No .csv files found in '$Folder'."
+        }
+
+        $aliasMap = Get-EvtxRelayFieldAliasMap -ConfigDir $ConfigDir -LogPath $LogPath
+
+        # detect every file up front, before creating the index, so the shared index's date
+        # mapping can be built from every format actually found in the folder instead of only
+        # the first file's. a file that fails detection is recorded here and skipped later,
+        # rather than aborting the whole batch
+        $detections = @{}
+        $primaryFormats = New-Object System.Collections.Generic.List[string]
+        $sharedTimestampField = $null
+        foreach ($csvPath in $csvPaths) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Detecting '$csvPath' ---"
+            try {
+                $detection = Resolve-EvtxRelayCsvFileDetection -File $csvPath -AliasMap $aliasMap `
+                    -AutoTimestampFormatCandidates $AutoTimestampFormatCandidates -Override $TimestampField `
+                    -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                    -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                $detections[$csvPath] = $detection
+                if ($detection.TimestampField) { $sharedTimestampField = $detection.TimestampField }
+                if ($detection.TimestampFormat) {
+                    $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
+                    if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                }
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Could not detect '$csvPath': $msg"
+                $detections[$csvPath] = $null
+            }
+        }
+
+        $unionedFormat = $null
+        if ($primaryFormats.Count -gt 0) {
+            $unionedFormat = ($primaryFormats -join '||') + '||strict_date_optional_time||epoch_millis'
+        }
+
+        $indexSetup = Resolve-EvtxRelayBatchIndexSetup -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+            -Tool $Tool -IndexName $IndexName -Exact:$ExactIndexName `
+            -TimestampField $sharedTimestampField -TimestampFormat $unionedFormat `
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+        $IndexName = $indexSetup.IndexName
+
+        $fileResults = New-Object System.Collections.Generic.List[object]
+        foreach ($csvPath in $csvPaths) {
+            $sourceFile = Split-Path -Leaf $csvPath
+            $detection = $detections[$csvPath]
+            if (-not $detection) {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+                continue
+            }
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Uploading '$csvPath' ---"
+            try {
+                $uploadResult = Invoke-EvtxRelayCsvBatchUpload -Records $detection.Records -HeaderMap $detection.HeaderMap `
+                    -SanitizedFields $detection.SanitizedFields -SourceFile $sourceFile -IndexName $IndexName `
+                    -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                    -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalRows })
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$csvPath': $msg"
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+        $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+        $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
+            -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
+        foreach ($r in $fileResults) {
+            $line = "$($r.File): $($r.Status)"
+            if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) rows into '$IndexName')" }
+            Write-EvtxRelayLog -LogPath $LogPath -Message $line
+        }
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+
         $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
         if ($failedCount -gt 0) {
