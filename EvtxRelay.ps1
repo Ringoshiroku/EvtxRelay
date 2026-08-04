@@ -63,7 +63,7 @@ param(
     [string]$File,
 
     [Parameter(Mandatory)]
-    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto')]
+    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log')]
     [string]$Tool,
 
     [string]$Folder,
@@ -1177,6 +1177,214 @@ function Invoke-EvtxRelayFileUpload {
 }
 
 
+# LOG FILE SUPPORT (-TOOL LOG)
+
+
+# figures out how to turn -tool log's raw lines into dated events: sends a sample of the file to
+# elasticsearch's own structure finder and, if it finds a usable per-line timestamp pattern, returns
+# the ingest pipeline processors needed to extract it. throws only when the file clearly isn't
+# log-shaped (e.g. it's really a csv); every other failure is soft and just means the caller indexes
+# lines untimed
+function Resolve-EvtxRelayLogStructure {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    # same sampling convention as -tool auto's structure-finder fallback: up to 1000 raw lines is
+    # plenty for confident detection, and keeps a huge log file from turning into a huge request
+    $sampleLines = @(Get-Content -LiteralPath $File -TotalCount 1000)
+    $sampleBody = $sampleLines -join "`n"
+
+    try {
+        $response = Invoke-ElkRequest -Uri "$ElasticBaseUri/_ml/find_file_structure" -Method Post `
+            -Headers $AuthHeaders -Body $sampleBody -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+    }
+    catch {
+        $detail = $_.ErrorDetails.Message
+        $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's structure finder could not analyze this file ($msg); every line will be indexed as a raw message with no timestamp."
+        return $null
+    }
+
+    if ($response.format -ne 'semi_structured_text') {
+        throw "This file doesn't look like an unstructured log to Elasticsearch (it detected '$($response.format)' instead). If it's actually delimited/tabular data, re-run with -Tool auto instead."
+    }
+
+    $timestampField = $response.timestamp_field
+    if (-not $timestampField -or -not $response.ingest_pipeline) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch could not find a reliable per-line timestamp in this file; every line will be indexed as a raw message with no timestamp."
+        return $null
+    }
+
+    $coveredCount = $response.field_stats.$timestampField.count
+    if ($coveredCount -and $response.num_messages_analyzed -and $coveredCount -lt $response.num_messages_analyzed) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected timestamp pattern only matched $coveredCount of $($response.num_messages_analyzed) sampled lines; some lines may end up indexed without a timestamp."
+    }
+
+    # only keep the processors that exist to find and set the timestamp. the structure finder's
+    # auto-derived grok pattern sometimes also captures an incidental field (e.g. a pid) and adds a
+    # 'convert' processor for it; that processor throwing on a line where the field isn't the type it
+    # expects would trip this pipeline's on_failure handler and mislabel a line whose timestamp parsed
+    # just fine as a parse failure, so anything other than grok/date/remove is dropped
+    $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
+        # PowerShell collapses a single-property object's .Name from an array to a plain
+        # scalar string, so indexing it directly with [0] would return the name's first
+        # character instead of the name itself. wrapping in @(...) forces array context first
+        (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove')
+    })
+
+    # elasticsearch's own date processor asks for a per-document 'event.timezone' field to resolve
+    # local-time logs (visible in the raw response as timezone: "{{ event.timezone }}"), which this
+    # tool's documents never set, so that reference would never resolve and every line's date parsing
+    # would fail, not just the ones that genuinely don't match. most log formats here (syslog-style)
+    # don't carry timezone info in the text anyway, so drop it and let the date processor fall back to
+    # elasticsearch's own default (utc) instead of failing outright
+    foreach ($proc in $keptProcessors) {
+        $procType = @($proc.PSObject.Properties.Name)[0]
+        if ($procType -eq 'date' -and $proc.date.PSObject.Properties.Name -contains 'timezone') {
+            $proc.date.PSObject.Properties.Remove('timezone')
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected date format needs a per-line timezone this file doesn't provide; timestamps will be parsed as UTC."
+        }
+    }
+
+    return [PSCustomObject]@{
+        Processors        = $keptProcessors
+        TimestampFieldRaw = $timestampField
+    }
+}
+
+# uploads a -tool log file: one bulk document per line, with a message field and, when
+# resolve-evtxrelaylogstructure found a usable pattern, an elasticsearch-parsed @timestamp field
+function Invoke-EvtxRelayLogUpload {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string]$Tool,
+        [switch]$Exact,
+        $StructureResult,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $IndexName = Resolve-EvtxRelayAvailableIndexName -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -Tool $Tool -SubModule 'events' -IndexName $IndexName -Exact:$Exact `
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+
+    # pipelines hold no data, so there's no need to check for an existing one first the way index
+    # creation does; a plain put always either creates it fresh or harmlessly overwrites it
+    $pipelineName = $null
+    if ($StructureResult) {
+        $pipelineName = "$IndexName-pipeline"
+        $pipelineBody = @{
+            description = "EvtxRelay log pipeline for '$IndexName'"
+            processors  = $StructureResult.Processors
+            on_failure  = @(
+                @{ set = @{ field = 'grok_parse_failed'; value = $true } }
+            )
+        }
+        Invoke-ElkRequest -Uri "$ElasticBaseUri/_ingest/pipeline/$pipelineName" -Method Put `
+            -Headers $AuthHeaders -Body ($pipelineBody | ConvertTo-Json -Depth 10) -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created ingest pipeline '$pipelineName' (detected via column '$($StructureResult.TimestampFieldRaw)')."
+    }
+
+    # elasticsearch's date processor always writes @timestamp in this exact shape regardless of
+    # what format the original text was in, so unlike -tool auto's structure-finder fallback there's
+    # no per-file format to translate here, just this one fixed constant
+    $timestampField = if ($StructureResult) { '@timestamp' } else { $null }
+    $timestampFormat = if ($StructureResult) { 'strict_date_optional_time||epoch_millis' } else { $null }
+
+    $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -TimestampField $timestampField -TimestampFormat $timestampFormat `
+        -SkipCertificateCheck:$SkipCertificateCheck
+    if ($indexCreated -and $timestampField) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$timestampField'."
+    }
+
+    # UPLOAD THE DATA IN BATCHES
+
+    $totalLines = $Lines.Count
+    $bulkErrors = New-Object System.Collections.Generic.List[object]
+    $bulkUri = "$ElasticBaseUri/$IndexName/_bulk"
+    if ($pipelineName) { $bulkUri += "?pipeline=$pipelineName" }
+
+    for ($start = 0; $start -lt $totalLines; $start += $BatchSize) {
+        $end = [Math]::Min($start + $BatchSize, $totalLines) - 1
+        $batch = @(foreach ($line in $Lines[$start..$end]) { [PSCustomObject]@{ message = $line } })
+        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $batch
+
+        $response = Invoke-ElkRequest -Uri $bulkUri -Method Post `
+            -Headers $AuthHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        if ($response.errors) {
+            for ($j = 0; $j -lt $response.items.Count; $j++) {
+                $item = $response.items[$j].index
+                if ($item.error) {
+                    $detailParts = New-Object System.Collections.Generic.List[string]
+                    $errNode = $item.error
+                    while ($errNode) {
+                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
+                        $errNode = $errNode.caused_by
+                    }
+                    $bulkErrors.Add([PSCustomObject]@{
+                        Row    = $start + $j + 1
+                        Type   = $item.error.type
+                        Reason = ($detailParts -join ' <- caused by: ')
+                    })
+                }
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed lines $($start + 1)-$($end + 1) of $totalLines into '$IndexName'."
+    }
+
+    $rowsIndexed = $totalLines - $bulkErrors.Count
+    if ($bulkErrors.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) line(s) failed to index:"
+        foreach ($e in $bulkErrors) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Line $($e.Row): $($e.Reason)"
+        }
+    }
+
+    # SET UP KIBANA
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+    $dataView = Confirm-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -TimestampField $timestampField -SkipCertificateCheck:$SkipCertificateCheck
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+    $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $timestampField `
+        -SkipCertificateCheck:$SkipCertificateCheck
+
+    # PRINT A SUMMARY
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Lines indexed:       $rowsIndexed / $totalLines"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Timestamp field:     $(if ($timestampField) { $timestampField } else { 'none (uploaded untimed)' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+
+    return [PSCustomObject]@{
+        IndexName          = $IndexName
+        TotalLines         = $totalLines
+        RowsIndexed        = $rowsIndexed
+        DataViewCreated    = $dataView.Created
+        SavedSearchCreated = $savedSearch.Created
+    }
+}
+
+
 # MAIN
 
 
@@ -1206,6 +1414,9 @@ try {
         }
         if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
             throw "File not found: '$File'"
+        }
+        if ($Tool -eq 'log' -and $TimestampField) {
+            throw "-TimestampField isn't supported with -Tool log; the timestamp always comes from Elasticsearch's structure finder as '@timestamp'."
         }
     }
 
@@ -1300,6 +1511,24 @@ try {
         if ($failedCount -gt 0) {
             throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
         }
+    }
+    elseif ($Tool -eq 'log') {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Reading log file: $File"
+        $lines = @(Get-Content -LiteralPath $File -Encoding UTF8)
+        if ($lines.Count -eq 0) {
+            throw "No lines found in '$File'."
+        }
+
+        $structureResult = Resolve-EvtxRelayLogStructure -File $File `
+            -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+
+        Invoke-EvtxRelayLogUpload -Lines $lines -IndexName $IndexName -Tool $Tool -Exact:$ExactIndexName `
+            -StructureResult $structureResult `
+            -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
     }
     else {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Reading CSV: $File"
