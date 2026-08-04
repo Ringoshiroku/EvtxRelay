@@ -56,6 +56,16 @@
     table in .evtxrelay\field-aliases.json (created with built-in defaults
     the first time -tool auto runs, and editable after that). every other
     column passes through untouched, same as the other three tools.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -File .\auth.log -Tool log
+
+    for a plain .log file instead of a csv, like syslog/auth.log, firewall
+    logs, or web server access logs. each line becomes one event with a raw
+    message field and, when elasticsearch can reliably detect a per-line
+    timestamp pattern, a parsed @timestamp field. a line that doesn't match
+    the pattern still gets uploaded, just tagged grok_parse_failed instead
+    of timed.
 #>
 [CmdletBinding()]
 param(

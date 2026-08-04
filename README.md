@@ -124,6 +124,40 @@ the alias table. If that succeeds, the column is renamed to
 usual. If Elasticsearch can't find one either, or can't be reached, the
 run still succeeds without one, same as it always has.
 
+### `-Tool log`: for plain `.log` files (syslog, firewall, access logs)
+
+`-Tool log` is for files that aren't tabular at all, like `auth.log`,
+firewall/device logs, or web server access logs: one event per line, no
+columns. Each line becomes an Elasticsearch document with a `message`
+field holding the line untouched.
+
+To find a timestamp in each line, EvtxRelay sends a sample of the file to
+the same Elasticsearch structure finder `-Tool auto` uses, but asks it to
+detect a per-line pattern instead of columns. If it finds one, EvtxRelay
+takes Elasticsearch's own suggested parsing steps (a pattern-matching step
+plus a date-parsing step) and turns them into an Elasticsearch ingest
+pipeline, so the actual per-line parsing happens on the server, not in
+PowerShell. Every line then gets a proper `@timestamp` field alongside its
+`message`. A line that doesn't match the detected pattern still gets
+indexed, just with `grok_parse_failed: true` set instead of an
+`@timestamp`, so a run is never derailed by a handful of odd lines; you
+can filter on that field in Kibana to see exactly which ones didn't parse.
+
+If Elasticsearch can't find a reliable timestamp pattern at all, or can't
+be reached, every line still gets uploaded with just its `message` field,
+same as any other timestamp-detection failure elsewhere in this tool: the
+run succeeds, it just won't be time-sorted. If Elasticsearch decides the
+file isn't actually log-shaped (for example, it's really a CSV in
+disguise), the run stops with a message suggesting `-Tool auto` instead,
+since forcing structured data through this raw-message-only path would
+throw away structure a different tool would have kept.
+
+This first version only extracts a timestamp and the raw line. It doesn't
+pull out other fields (source IP, usernames, and so on) the way `-Tool
+auto` does for CSVs, and it doesn't merge multi-line events (like a stack
+trace spanning several lines) into one document; each line is always its
+own event.
+
 ### APT-Hunter is different: a folder of CSVs, not one file
 
 APT-Hunter writes one CSV per event category into a single output folder
@@ -313,7 +347,7 @@ your lab certificate is self-signed:
 | Parameter              | Required     | Default      | Purpose |
 |------------------------|---------------|--------------|---------|
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
-| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, or `auto`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. |
+| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, or `log`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. |
 | `-Folder`               | If apt-hunter | none         | Path to the folder of CSVs produced by APT-Hunter. Only used with `-Tool apt-hunter`; every `.csv` in the folder is uploaded to its own index in one run. |
 | `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
 | `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
@@ -321,7 +355,7 @@ your lab certificate is self-signed:
 | `-ElasticPort`          | No            | `9200`       | Local port EvtxRelay connects to for Elasticsearch. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-BatchSize`            | No            | `2000`       | Rows sent per bulk request. |
-| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. Not supported with `-Tool apt-hunter`, since each category file has its own differently-named date column. |
+| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column) or `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself). |
 | `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS or lab certificates. Turned on automatically when `-UseSshTunnel` is used. |
 | `-ResetCredential`      | No            | off          | Asks for your credentials again, for example after a password change. |
 | `-UseSshTunnel`         | No            | off (saved)  | Opens or reuses a background SSH tunnel to reach an Elasticsearch or Kibana that only listens on the VPS's own localhost. |
