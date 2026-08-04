@@ -140,8 +140,13 @@ pipeline, so the actual per-line parsing happens on the server, not in
 PowerShell. Every line then gets a proper `@timestamp` field alongside its
 `message`. A line that doesn't match the detected pattern still gets
 indexed, just with `grok_parse_failed: true` set instead of an
-`@timestamp`, so a run is never derailed by a handful of odd lines; you
-can filter on that field in Kibana to see exactly which ones didn't parse.
+`@timestamp`, so a run is never derailed by a handful of odd lines. Because
+the saved search this tool creates is time-filtered on `@timestamp`, those
+lines never show up in it, no matter what filter you add on top; the run's
+summary reports how many lines were tagged `grok_parse_failed`, and you can
+find the actual lines with a direct query against the index (for example
+`grok_parse_failed:true` in Kibana's Dev Tools console, or a second data
+view that isn't time-based).
 
 If Elasticsearch can't find a reliable timestamp pattern at all, or can't
 be reached, every line still gets uploaded with just its `message` field,
@@ -152,11 +157,15 @@ disguise), the run stops with a message suggesting `-Tool auto` instead,
 since forcing structured data through this raw-message-only path would
 throw away structure a different tool would have kept.
 
-This first version only extracts a timestamp and the raw line. It doesn't
-pull out other fields (source IP, usernames, and so on) the way `-Tool
-auto` does for CSVs, and it doesn't merge multi-line events (like a stack
-trace spanning several lines) into one document; each line is always its
-own event.
+This first version is only meant to extract a timestamp and keep the raw
+line as `message`. Elasticsearch's auto-derived pattern occasionally
+captures and passes through an incidental extra field too (whatever it
+happens to name it), but EvtxRelay doesn't validate or promise anything
+beyond the timestamp and `message`; it's not the deliberate field
+extraction (source IP, usernames, and so on) that `-Tool auto` does for
+CSVs, and that's still out of scope here. It also doesn't merge multi-line
+events (like a stack trace spanning several lines) into one document; each
+line is always its own event.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
 

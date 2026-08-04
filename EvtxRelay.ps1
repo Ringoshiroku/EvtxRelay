@@ -1262,6 +1262,15 @@ function Resolve-EvtxRelayLogStructure {
         }
     }
 
+    # if filtering above dropped every processor that would have set the timestamp, there's nothing
+    # left to write @timestamp, so fall back to the same untimed path as a structure-finder failure
+    # instead of creating a pipeline and a date-mapped index that never actually get a timestamp
+    $hasDate = @($keptProcessors | Where-Object { @($_.PSObject.Properties.Name)[0] -eq 'date' }).Count -gt 0
+    if (-not $hasDate) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's suggested pipeline has no usable timestamp step for this file; every line will be indexed as a raw message with no timestamp."
+        return $null
+    }
+
     return [PSCustomObject]@{
         Processors        = $keptProcessors
         TimestampFieldRaw = $timestampField
@@ -1377,11 +1386,23 @@ function Invoke-EvtxRelayLogUpload {
         -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $timestampField `
         -SkipCertificateCheck:$SkipCertificateCheck
 
+    # lines the pipeline's on_failure handler tagged never get an @timestamp, so they're invisible in
+    # the time-filtered saved search; surface the count here since it's the only place that shows them
+    $unparsedCount = $null
+    if ($pipelineName) {
+        $countResponse = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_count?q=grok_parse_failed:true" -Method Get `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+        $unparsedCount = $countResponse.count
+    }
+
     # PRINT A SUMMARY
 
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
     Write-EvtxRelayLog -LogPath $LogPath -Message "Lines indexed:       $rowsIndexed / $totalLines"
     Write-EvtxRelayLog -LogPath $LogPath -Message "Timestamp field:     $(if ($timestampField) { $timestampField } else { 'none (uploaded untimed)' })"
+    if ($null -ne $unparsedCount) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Lines not parsed:    $unparsedCount / $totalLines (tagged grok_parse_failed, no timestamp)"
+    }
     Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
     Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
 
