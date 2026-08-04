@@ -1841,6 +1841,9 @@ try {
             throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
         }
     }
+    elseif ($Tool -eq 'log' -and $Folder) {
+        throw "-Folder isn't wired up yet for -Tool log; use -File instead."
+    }
     elseif ($Tool -eq 'log') {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Reading log file: $File"
         $lines = @(Get-Content -LiteralPath $File -Encoding UTF8)
