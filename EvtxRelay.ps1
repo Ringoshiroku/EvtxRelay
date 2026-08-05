@@ -1262,17 +1262,47 @@ function Resolve-EvtxRelayLogStructure {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected timestamp pattern only matched $coveredCount of $($response.num_messages_analyzed) sampled lines; some lines may end up indexed without a timestamp."
     }
 
-    # only keep the processors that exist to find and set the timestamp. the structure finder's
-    # auto-derived grok pattern sometimes also captures an incidental field (e.g. a pid) and adds a
-    # 'convert' processor for it; that processor throwing on a line where the field isn't the type it
-    # expects would trip this pipeline's on_failure handler and mislabel a line whose timestamp parsed
-    # just fine as a parse failure, so anything other than grok/date/remove is dropped
-    $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
-        # PowerShell collapses a single-property object's .Name from an array to a plain
-        # scalar string, so indexing it directly with [0] would return the name's first
-        # character instead of the name itself. wrapping in @(...) forces array context first
-        (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove')
-    })
+    # field names this tool always sets itself; a real extracted field landing on one of these
+    # would silently overwrite it, so field-extraction tiers below check candidate field names
+    # against this list before building a pipeline, same defensive pattern as -folder mode's
+    # source_file guard (resolve-evtxrelaycsvfiledetection)
+    $reservedFieldNames = @('message', '@timestamp', 'source_file', 'grok_parse_failed')
+
+    # a bare reference to one of elasticsearch's own named patterns (like %{combinedapachelog})
+    # means the structure finder recognized a known format, not just guessed one from this one
+    # sample. that pattern's captures are well-tested and worth trusting; anything else is a
+    # pattern elasticsearch synthesized on the fly for this specific file, which (per a live test
+    # during design) can produce meaningless capture names and even a wrong timestamp for
+    # key=value-style text, so it's only ever trusted for the timestamp, never for other fields
+    $isTrustedPattern = $response.grok_pattern -match '^%\{[A-Z_]+\}$'
+
+    if ($isTrustedPattern) {
+        # keep every processor the trusted pattern defines, including 'convert': these are the
+        # pattern's own well-tested field definitions, not incidental captures, and elasticsearch's
+        # own response already sets ignore_missing on every convert step, so a field that's simply
+        # absent on some lines doesn't trip anything
+        $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
+            (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove', 'convert')
+        })
+
+        $collisionField = @($response.mappings.properties.PSObject.Properties.Name | Where-Object { $_ -cin @('source_file', 'grok_parse_failed') })
+        if ($collisionField.Count -gt 0) {
+            throw "Elasticsearch's detected pattern for this file extracts a field called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that field's source data before re-running, or use -Tool auto if this is really tabular data."
+        }
+    }
+    else {
+        # only keep the processors that exist to find and set the timestamp. the structure finder's
+        # auto-derived grok pattern sometimes also captures an incidental field (e.g. a pid) and adds a
+        # 'convert' processor for it; that processor throwing on a line where the field isn't the type it
+        # expects would trip this pipeline's on_failure handler and mislabel a line whose timestamp parsed
+        # just fine as a parse failure, so anything other than grok/date/remove is dropped
+        $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
+            # PowerShell collapses a single-property object's .Name from an array to a plain
+            # scalar string, so indexing it directly with [0] would return the name's first
+            # character instead of the name itself. wrapping in @(...) forces array context first
+            (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove')
+        })
+    }
 
     # elasticsearch's own date processor asks for a per-document 'event.timezone' field to resolve
     # local-time logs (visible in the raw response as timezone: "{{ event.timezone }}"), which this
