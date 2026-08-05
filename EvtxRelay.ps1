@@ -19,6 +19,12 @@
     one, so use -Folder with -Tool apt-hunter instead of -File, and every csv
     in the folder gets uploaded into its own index in one run.
 
+    -Tool auto and -Tool log also accept -Folder, for a folder of same-kind
+    files (the same export tool run against several hosts, or a rotated log
+    directory). unlike apt-hunter, every file in the folder shares one index
+    instead of getting its own, with a source_file field on each document so
+    you can still tell which file a given row or line came from.
+
     kibana changed how data views are managed between versions, so this
     script tries the newer way first and automatically falls back to the
     older way if that fails.
@@ -58,6 +64,14 @@
     column passes through untouched, same as the other three tools.
 
 .EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\exports -Tool auto
+
+    for a folder of csvs of the same kind (for example, the same export tool
+    run against several hosts). every file is detected independently, but
+    they all land in one shared index instead of one each, with a
+    source_file field on every row so you can still tell them apart.
+
+.EXAMPLE
     .\EvtxRelay.ps1 -File .\auth.log -Tool log
 
     for a plain .log file instead of a csv, like syslog/auth.log, firewall
@@ -66,6 +80,15 @@
     timestamp pattern, a parsed @timestamp field. a line that doesn't match
     the pattern still gets uploaded, just tagged grok_parse_failed instead
     of timed.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\var-log -Tool log
+
+    for a folder of log files, like a rotated auth.log directory
+    (auth.log, auth.log.1, auth.log.2). every file in the folder is picked
+    up except compressed ones (.gz/.zip/.bz2, skipped rather than
+    decompressed), each gets its own timestamp detection, and they all land
+    in one shared index tagged with source_file.
 #>
 [CmdletBinding()]
 param(

@@ -124,6 +124,24 @@ the alias table. If that succeeds, the column is renamed to
 usual. If Elasticsearch can't find one either, or can't be reached, the
 run still succeeds without one, same as it always has.
 
+`-Tool auto` also accepts `-Folder` instead of `-File`, for a folder of
+CSVs that are the same kind of data, like the same export tool run against
+several hosts. Unlike APT-Hunter's folder mode, every file lands in one
+shared index instead of getting its own, since splitting same-kind data
+across indices would force you to flip between Kibana Data Views to
+correlate events across hosts in the same time window. Each file still
+gets fully independent detection (its own columns, its own timestamp
+column and date format), and every uploaded row gets a `source_file` field
+holding the filename, so you can still filter or group by origin file in
+Kibana without losing the single unified timeline. If two files use
+different date formats for their timestamp column, EvtxRelay detects every
+file's format before creating the index and builds a mapping that accepts
+all of them, not just the first file's. A file that fails (unreadable, no
+timestamp column) is logged and skipped, same as any other file-level
+failure in this tool; it doesn't abort the rest of the folder. Files are
+discovered the same way APT-Hunter's folder mode already does: every
+`*.csv` in the folder, no recursion into subdirectories.
+
 ### `-Tool log`: for plain `.log` files (syslog, firewall, access logs)
 
 `-Tool log` is for files that aren't tabular at all, like `auth.log`,
@@ -166,6 +184,22 @@ extraction (source IP, usernames, and so on) that `-Tool auto` does for
 CSVs, and that's still out of scope here. It also doesn't merge multi-line
 events (like a stack trace spanning several lines) into one document; each
 line is always its own event.
+
+`-Tool log` also accepts `-Folder` instead of `-File`, for a folder of log
+files, like a rotated `auth.log` directory (`auth.log`, `auth.log.1`,
+`auth.log.2`, `messages`, `secure`, with no consistent extension). Every
+file in the folder is picked up except compressed ones (`.gz`/`.zip`/
+`.bz2`, skipped rather than decompressed), no recursion into
+subdirectories. As with `-Tool auto`'s folder mode, every file lands in
+one shared index instead of getting its own, tagged with a `source_file`
+field per row so you can filter by origin file in Kibana. Different files
+can genuinely need different parsing patterns (a firewall log and a VPN
+log rarely share a line format), so each file gets its own ingest
+pipeline built from its own structure-finder result, even though they all
+write into the same index. A file that isn't log-shaped (for example, a
+CSV run through `-Tool log` by mistake) is logged and skipped rather than
+stopping the whole folder, unlike the single-file case where that's a
+hard stop; the rest of the folder still uploads.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
 
@@ -357,7 +391,7 @@ your lab certificate is self-signed:
 |------------------------|---------------|--------------|---------|
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
 | `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, or `log`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. |
-| `-Folder`               | If apt-hunter | none         | Path to the folder of CSVs produced by APT-Hunter. Only used with `-Tool apt-hunter`; every `.csv` in the folder is uploaded to its own index in one run. |
+| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`) or `-Tool log` (every file except `.gz`/`.zip`/`.bz2`); for those two, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd`. |
 | `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
 | `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
 | `-ElkHost`              | No            | saved value  | Elasticsearch and Kibana host, or the SSH target host if using `-UseSshTunnel`. Works the same whether it's a remote VPS or a lab machine on your local network. Also updates the saved value. |
