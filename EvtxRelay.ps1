@@ -1461,7 +1461,7 @@ function Resolve-EvtxRelayCsvFileDetection {
         [Parameter(Mandatory)][string]$LogPath
     )
 
-    $records = @(Import-Csv -Path $File -Encoding UTF8)
+    $records = @(Import-Csv -LiteralPath $File -Encoding UTF8)
     if ($records.Count -eq 0) {
         throw "No data rows found in '$File'."
     }
@@ -1518,8 +1518,11 @@ function Resolve-EvtxRelayCsvFileDetection {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not auto-detect a timestamp column in this file; its rows will not be time-sorted."
     }
 
+    if ($sanitizedFields -contains 'source_file') {
+        throw "Column 'source_file' collides with the field folder mode adds automatically to tag each row's source file. Rename the source column before re-running with -Folder."
+    }
+
     return [PSCustomObject]@{
-        Records         = $records
         HeaderMap       = $headerMap
         SanitizedFields = $sanitizedFields
         TimestampField  = $resolvedTimestampField
@@ -1880,6 +1883,11 @@ try {
                 }
             }
             catch {
+                if ($_.Exception.Message -like "No data rows found in *") {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$csvPath': no data rows."
+                    $detections[$csvPath] = 'EMPTY'
+                    continue
+                }
                 $detail = $_.ErrorDetails.Message
                 $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
                 Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Could not detect '$csvPath': $msg"
@@ -1902,13 +1910,20 @@ try {
         foreach ($csvPath in $csvPaths) {
             $sourceFile = Split-Path -Leaf $csvPath
             $detection = $detections[$csvPath]
+            if ($detection -eq 'EMPTY') {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Skipped (empty)' })
+                continue
+            }
             if (-not $detection) {
                 $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
                 continue
             }
             Write-EvtxRelayLog -LogPath $LogPath -Message "--- Uploading '$csvPath' ---"
             try {
-                $uploadResult = Invoke-EvtxRelayCsvBatchUpload -Records $detection.Records -HeaderMap $detection.HeaderMap `
+                # re-parses the file here instead of reusing the detection pass's rows, so folder
+                # mode only ever holds one file's rows in memory at a time, same as single-file mode
+                $records = @(Import-Csv -LiteralPath $csvPath -Encoding UTF8)
+                $uploadResult = Invoke-EvtxRelayCsvBatchUpload -Records $records -HeaderMap $detection.HeaderMap `
                     -SanitizedFields $detection.SanitizedFields -SourceFile $sourceFile -IndexName $IndexName `
                     -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
                     -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
