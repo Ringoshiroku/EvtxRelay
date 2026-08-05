@@ -136,11 +136,14 @@ holding the filename, so you can still filter or group by origin file in
 Kibana without losing the single unified timeline. If two files use
 different date formats for their timestamp column, EvtxRelay detects every
 file's format before creating the index and builds a mapping that accepts
-all of them, not just the first file's. A file that fails (unreadable, no
-timestamp column) is logged and skipped, same as any other file-level
-failure in this tool; it doesn't abort the rest of the folder. Files are
-discovered the same way APT-Hunter's folder mode already does: every
-`*.csv` in the folder, no recursion into subdirectories.
+all of them, not just the first file's. A file that's genuinely unreadable
+or empty, or hits a structure-finder column-naming collision, is logged
+and marked Failed, and is excluded from the folder; it doesn't abort the
+rest of the batch. A file where simply no timestamp column is found still
+uploads into the shared index, just untimed, same as single-file
+`-Tool auto`'s own behavior above. Files are discovered the same way
+APT-Hunter's folder mode already does: every `*.csv` in the folder, no
+recursion into subdirectories.
 
 ### `-Tool log`: for plain `.log` files (syslog, firewall, access logs)
 
@@ -196,10 +199,14 @@ field per row so you can filter by origin file in Kibana. Different files
 can genuinely need different parsing patterns (a firewall log and a VPN
 log rarely share a line format), so each file gets its own ingest
 pipeline built from its own structure-finder result, even though they all
-write into the same index. A file that isn't log-shaped (for example, a
-CSV run through `-Tool log` by mistake) is logged and skipped rather than
-stopping the whole folder, unlike the single-file case where that's a
-hard stop; the rest of the folder still uploads.
+write into the same index. Unlike single-file `-Tool log`, where a file
+with no reliable per-line timestamp pattern still uploads untimed with
+just `message`, folder mode marks that file Failed and does not upload
+its lines at all; only files where Elasticsearch finds a pattern land in
+the shared index. A file that isn't log-shaped (for example, a CSV run
+through `-Tool log` by mistake) is also marked Failed rather than
+stopping the whole folder; either way, the rest of the folder still
+uploads.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
 
