@@ -1603,11 +1603,7 @@ function Invoke-EvtxRelayCsvBatchUpload {
     return [PSCustomObject]@{ TotalRows = $totalRows; RowsIndexed = $rowsIndexed; MissingColumns = $missingColumns }
 }
 
-# uploads one already-structure-detected log file's lines into a shared index that folder mode
-# already created, tagging every line with which file it came from. unlike -tool auto's shared
-# index, -tool log's shared index always uses a fixed @timestamp mapping (set once, in folder
-# mode's index setup call), so this function only needs to handle each file's own ingest
-# pipeline, not the index's date mapping
+# uploads one already-detected log file's lines into folder mode's shared index, tagging each line with its source file
 function Invoke-EvtxRelayLogBatchUpload {
     param(
         [Parameter(Mandatory)][string[]]$Lines,
@@ -1621,12 +1617,7 @@ function Invoke-EvtxRelayLogBatchUpload {
         [Parameter(Mandatory)][string]$LogPath
     )
 
-    # each file gets its own pipeline, since elasticsearch pipelines are chosen per bulk request
-    # (?pipeline=name) rather than fixed to an index, so different files in the same folder can
-    # use different grok patterns without conflicting. a plain put always either creates a
-    # pipeline fresh or harmlessly overwrites it, same as the single-file log path already relies
-    # on, and this loop only ever uses the pipeline it just created for its own file's uploads, so
-    # a name collision between two files across loop iterations is harmless
+    # each file gets its own pipeline, since a bulk request picks its pipeline per call, not per index
     $pipelineName = $null
     if ($StructureResult) {
         # slugs the whole filename, not just its base name, so "auth.log" and "auth.log.1"
@@ -1964,6 +1955,12 @@ try {
                 $structureResult = Resolve-EvtxRelayLogStructure -File $sourceLogPath `
                     -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
                     -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+
+                if (-not $structureResult) {
+                    Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$sourceLogPath': no reliable per-line timestamp could be detected."
+                    $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+                    continue
+                }
 
                 $uploadResult = Invoke-EvtxRelayLogBatchUpload -Lines $lines -SourceFile $sourceFile -IndexName $IndexName `
                     -StructureResult $structureResult `
