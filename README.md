@@ -178,15 +178,37 @@ disguise), the run stops with a message suggesting `-Tool auto` instead,
 since forcing structured data through this raw-message-only path would
 throw away structure a different tool would have kept.
 
-This first version is only meant to extract a timestamp and keep the raw
-line as `message`. Elasticsearch's auto-derived pattern occasionally
-captures and passes through an incidental extra field too (whatever it
-happens to name it), but EvtxRelay doesn't validate or promise anything
-beyond the timestamp and `message`; it's not the deliberate field
-extraction (source IP, usernames, and so on) that `-Tool auto` does for
-CSVs, and that's still out of scope here. It also doesn't merge multi-line
-events (like a stack trace spanning several lines) into one document; each
-line is always its own event.
+Beyond the timestamp, EvtxRelay now extracts real fields from two kinds
+of log line it can detect reliably. If Elasticsearch recognizes the line
+as one of its own known formats (for example, a web server's combined
+access log), every field that format defines gets pulled out and
+correctly typed — client IP as a real IP field, status codes and byte
+counts as numbers, and so on — not just an incidental field or two.
+
+If the line isn't a known format but looks like `key=value` text (common
+for firewall and similar device logs, for example `srcip=10.1.1.5
+action=deny`), EvtxRelay extracts every key as its own field, using the
+log's own key names. Elasticsearch's own pattern-guessing isn't reliable
+for this kind of line (an ad-hoc guess can produce meaningless field
+names, and in one case tested during development, silently dropped the
+time-of-day entirely when a timestamp was split across two separate keys
+like `date=`/`time=`), so this path builds its own extraction instead of
+trusting that guess. When a `date` and a `time` key are both present,
+they're combined into one real, fully-precise timestamp; a single field
+named `timestamp`, `time`, or `datetime` works too. A file whose extracted
+field would collide with a field EvtxRelay sets itself (`message`,
+`@timestamp`, `source_file`, `grok_parse_failed`) stops with a clear error
+instead of silently overwriting it, same as `-Tool auto`'s column-collision
+guards.
+
+Any line that doesn't fit either of those two shapes still gets just a
+timestamp and `message`, exactly as before — this isn't a general-purpose
+field-extraction engine for arbitrary log formats, and formats that mix
+several different message layouts in one file (a firewall log with many
+different message types under one general syslog structure, for example)
+aren't reliably covered by either path above. It also doesn't merge
+multi-line events (like a stack trace spanning several lines) into one
+document; each line is always its own event.
 
 `-Tool log` also accepts `-Folder` instead of `-File`, for a folder of log
 files, like a rotated `auth.log` directory (`auth.log`, `auth.log.1`,
