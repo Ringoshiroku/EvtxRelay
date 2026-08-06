@@ -2208,6 +2208,14 @@ try {
             -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
         $IndexName = $indexSetup.IndexName
 
+        # -tool log -folder creates its shared index before any file's fields are known (unlike
+        # -tool auto -folder, which detects every file first), so ip-like fields are added
+        # incrementally as each file introduces them. this set tracks which field names have
+        # already been declared on the shared index this run, so a batch of files that mostly
+        # share the same field names (many fortigate exports all carrying srcip/dstip) only
+        # triggers one _mapping call per new field name, not one per file
+        $declaredFieldTypes = @{}
+
         $fileResults = New-Object System.Collections.Generic.List[object]
         foreach ($sourceLogPath in $logPaths) {
             # named $sourceLogPath, not $logPath: powershell variable names are case-insensitive,
@@ -2232,6 +2240,19 @@ try {
                     Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$sourceLogPath': no reliable per-line timestamp could be detected."
                     $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
                     continue
+                }
+
+                $newFieldTypes = @{}
+                foreach ($field in $structureResult.FieldTypeMappings.Keys) {
+                    if (-not $declaredFieldTypes.ContainsKey($field)) {
+                        $newFieldTypes[$field] = $structureResult.FieldTypeMappings[$field]
+                        $declaredFieldTypes[$field] = $structureResult.FieldTypeMappings[$field]
+                    }
+                }
+                if ($newFieldTypes.Count -gt 0) {
+                    Add-EvtxRelayFieldTypeMappings -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                        -IndexName $IndexName -FieldTypeMappings $newFieldTypes `
+                        -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
                 }
 
                 $uploadResult = Invoke-EvtxRelayLogBatchUpload -Lines $lines -SourceFile $sourceFile -IndexName $IndexName `
