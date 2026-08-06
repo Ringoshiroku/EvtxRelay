@@ -1377,6 +1377,7 @@ function Resolve-EvtxRelayLogStructure {
 
     $timestampField = $response.timestamp_field
     $keptProcessors = $null
+    $fieldTypeMappings = @{}
 
     if ($isKvShaped) {
         # scan the same sample used for kv-shape detection to get a preview of the real field
@@ -1393,6 +1394,13 @@ function Resolve-EvtxRelayLogStructure {
         $collisionField = @($extractedKeys | Where-Object { $_ -cin $reservedFieldNames })
         if ($collisionField.Count -gt 0) {
             throw "This file's key=value fields include one called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that key in the source data before re-running."
+        }
+
+        # no elasticsearch-provided type info exists for kv-extracted fields (kv just splits
+        # text), so a name-based heuristic is the only way any of them end up typed as anything
+        # other than plain text
+        foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $extractedKeys.ToArray())) {
+            $fieldTypeMappings[$ipField] = 'ip'
         }
 
         # trim_value strips the surrounding double quotes many key=value formats wrap string
@@ -1471,6 +1479,17 @@ function Resolve-EvtxRelayLogStructure {
             if ($collisionField.Count -gt 0) {
                 throw "Elasticsearch's detected pattern for this file extracts a field called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that field's source data before re-running, or use -Tool auto if this is really tabular data."
             }
+
+            # a trusted pattern's own mappings already carry real, computed types (e.g. clientip
+            # as ip) from elasticsearch's own well-tested field definitions, not a guess, so this
+            # is trusted the same way the pattern's grok/convert processors already are. only ip
+            # is pulled through: numeric fields already end up correctly typed today via the
+            # convert processors kept above plus elasticsearch's own numeric dynamic detection
+            foreach ($prop in $response.mappings.properties.PSObject.Properties) {
+                if ($prop.Value.type -eq 'ip') {
+                    $fieldTypeMappings[$prop.Name] = 'ip'
+                }
+            }
         }
         else {
             # only keep the processors that exist to find and set the timestamp. the structure finder's
@@ -1513,6 +1532,7 @@ function Resolve-EvtxRelayLogStructure {
     return [PSCustomObject]@{
         Processors        = $keptProcessors
         TimestampFieldRaw = $timestampField
+        FieldTypeMappings = $fieldTypeMappings
     }
 }
 
@@ -1563,6 +1583,7 @@ function Invoke-EvtxRelayLogUpload {
 
     $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $IndexName -TimestampField $timestampField -TimestampFormat $timestampFormat `
+        -FieldTypeMappings $(if ($StructureResult) { $StructureResult.FieldTypeMappings } else { @{} }) `
         -SkipCertificateCheck:$SkipCertificateCheck
     if ($indexCreated -and $timestampField) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$timestampField'."
