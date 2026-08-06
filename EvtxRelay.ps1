@@ -1283,12 +1283,28 @@ function Resolve-EvtxRelayLogStructure {
     # key=value text (like firewall syslog) doesn't need grok at all, and elasticsearch's own
     # ad-hoc pattern for this shape is unreliable (see resolve-evtxrelaylogstructure's header
     # comment). a sample where most lines carry several key=value-looking tokens is judged
-    # kv-shaped independently of whatever grok pattern elasticsearch proposed
+    # kv-shaped, but only when those tokens also make up most of the line, not just a handful
+    # of them: a syslog-framed line like 'Aug 15 10:22:31 fw1 CEF: date=2026-08-15 time=10:22:45
+    # srcip=10.1.1.6 action=deny' has enough key=value tokens to pass an absolute count on its
+    # own, but its leading syslog prefix isn't key=value at all, and elasticsearch's kv ingest
+    # processor throws on the first token it can't split on '=', aborting the rest of the
+    # pipeline (including the timestamp step) via on_failure. requiring a high median ratio of
+    # kv tokens to total tokens per line, on top of the existing absolute count, lets a short
+    # all-kv line still qualify while rejecting a long line that's mostly non-kv prefix. 0.8 is
+    # a starting point from live testing during this fix, not a hard commitment
     $kvTokenPattern = '\b[A-Za-z_][A-Za-z0-9_.]*=\S'
-    $kvLineCounts = @($sampleLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object {
-        @([regex]::Matches($_, $kvTokenPattern)).Count
-    })
-    $isKvShaped = (-not $isTrustedPattern) -and ((Get-EvtxRelayMedian -Values $kvLineCounts) -ge 3)
+    $kvLineCounts = New-Object System.Collections.Generic.List[int]
+    $kvRatioPercents = New-Object System.Collections.Generic.List[int]
+    foreach ($line in $sampleLines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $kvCount = @([regex]::Matches($line, $kvTokenPattern)).Count
+        $totalTokenCount = @($line.Trim() -split '\s+').Count
+        $kvLineCounts.Add($kvCount)
+        $kvRatioPercents.Add([int][Math]::Round(100.0 * $kvCount / $totalTokenCount))
+    }
+    $isKvShaped = (-not $isTrustedPattern) `
+        -and ((Get-EvtxRelayMedian -Values $kvLineCounts.ToArray()) -ge 3) `
+        -and ((Get-EvtxRelayMedian -Values $kvRatioPercents.ToArray()) -ge 80)
 
     $timestampField = $response.timestamp_field
     $keptProcessors = $null
@@ -1311,9 +1327,12 @@ function Resolve-EvtxRelayLogStructure {
         }
 
         # trim_value strips the surrounding double quotes many key=value formats wrap string
-        # values in (e.g. fortigate's action="close"), so the extracted field holds just close
+        # values in (e.g. fortigate's action="close"), so the extracted field holds just close.
+        # exclude_keys is the structural backstop for the collision check above: that check only
+        # sees the first 1000 sampled lines, but exclude_keys makes elasticsearch itself refuse
+        # to extract any reserved name for the whole file, not just the sampled part
         $kvProcessors = New-Object System.Collections.Generic.List[object]
-        $kvProcessors.Add(@{ kv = @{ field = 'message'; field_split = '\s+'; value_split = '='; trim_value = '"' } })
+        $kvProcessors.Add(@{ kv = @{ field = 'message'; field_split = '\s+'; value_split = '='; trim_value = '"'; exclude_keys = $reservedFieldNames } })
 
         # a date key and a time key together (fortigate's date=/time=) need concatenating into
         # one string before elasticsearch's date processor can parse a real, full-precision
@@ -1321,20 +1340,26 @@ function Resolve-EvtxRelayLogStructure {
         # design: it only captured the date portion, giving every line the same day-level
         # timestamp with no time-of-day at all), and a script processor is the only ingest-
         # pipeline tool that can combine two already-extracted fields into one
-        if (($extractedKeys -ccontains 'date') -and ($extractedKeys -ccontains 'time')) {
-            $kvProcessors.Add(@{ script = @{ source = "if (ctx.date != null && ctx.time != null) { ctx.evtxrelay_timestamp = ctx.date + ' ' + ctx.time }" } })
+        # resolve-evtxrelaytimestampfield already implements the exact-case-first-then-case-
+        # insensitive two-pass lookup this needs (see its own comment for why exact case has to
+        # win first), so a key extracted as 'Date'/'Time' still gets picked up here instead of
+        # silently losing its timestamp just because the case doesn't match 'date'/'time'
+        $dateKey = Resolve-EvtxRelayTimestampField -SanitizedFields $extractedKeys.ToArray() -Candidates @('date')
+        $timeKey = Resolve-EvtxRelayTimestampField -SanitizedFields $extractedKeys.ToArray() -Candidates @('time')
+        if ($dateKey -and $timeKey) {
+            $kvProcessors.Add(@{ script = @{ source = "if (ctx.$dateKey != null && ctx.$timeKey != null) { ctx.evtxrelay_timestamp = ctx.$dateKey + ' ' + ctx.$timeKey }" } })
             $kvProcessors.Add(@{ date = @{ field = 'evtxrelay_timestamp'; formats = @('yyyy-MM-dd HH:mm:ss', 'MM/dd/yyyy HH:mm:ss') } })
             $kvProcessors.Add(@{ remove = @{ field = 'evtxrelay_timestamp'; ignore_missing = $true } })
-            $timestampField = 'date+time'
+            $timestampField = "$dateKey+$timeKey"
         }
         else {
-            $singleTimestampKey = @($extractedKeys | Where-Object { $_ -cin @('timestamp', 'time', 'datetime') })[0]
+            $singleTimestampKey = Resolve-EvtxRelayTimestampField -SanitizedFields $extractedKeys.ToArray() -Candidates @('timestamp', 'time', 'datetime')
             if ($singleTimestampKey) {
                 $kvProcessors.Add(@{ date = @{ field = $singleTimestampKey; formats = @('ISO8601', 'yyyy-MM-dd HH:mm:ss', 'MM/dd/yyyy HH:mm:ss') } })
                 $timestampField = $singleTimestampKey
             }
             else {
-                Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "This file's key=value fields don't include a recognizable date/time key; every line will be indexed with its extracted fields but no timestamp."
+                Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "This file's key=value fields don't include a recognizable date/time key; every line will be indexed as a raw message with no timestamp."
                 return $null
             }
         }
@@ -1366,7 +1391,14 @@ function Resolve-EvtxRelayLogStructure {
                 (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove', 'convert')
             })
 
-            $collisionField = @($response.mappings.properties.PSObject.Properties.Name | Where-Object { $_ -cin @('source_file', 'grok_parse_failed') })
+            # 'message' and '@timestamp' are deliberately left out of this check, unlike the kv
+            # tier's collision check which uses the full $reservedFieldNames list: a trusted-
+            # pattern response's mappings always legitimately contain those two as this tool's own
+            # standard fields, so checking them here threw a false-positive collision on every
+            # single trusted-pattern file (hit and fixed during task 1 of this plan). deriving from
+            # $reservedFieldNames instead of a second hardcoded list keeps there being one source
+            # of truth for what counts as a reserved name
+            $collisionField = @($response.mappings.properties.PSObject.Properties.Name | Where-Object { $_ -cin ($reservedFieldNames | Where-Object { $_ -notin @('message', '@timestamp') }) })
             if ($collisionField.Count -gt 0) {
                 throw "Elasticsearch's detected pattern for this file extracts a field called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that field's source data before re-running, or use -Tool auto if this is really tabular data."
             }

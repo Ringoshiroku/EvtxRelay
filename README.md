@@ -228,7 +228,12 @@ its lines at all; only files where Elasticsearch finds a pattern land in
 the shared index. A file that isn't log-shaped (for example, a CSV run
 through `-Tool log` by mistake) is also marked Failed rather than
 stopping the whole folder; either way, the rest of the folder still
-uploads.
+uploads. Because every file's extracted fields land in that same shared
+index, two files that extract a same-named field with different apparent
+types (one file's `id=123` inferred as a number, another's
+`id=abc-forwarded` wanting to be a string) will show per-line indexing
+errors for whichever file's lines don't match the mapping the index
+already settled on.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
 
