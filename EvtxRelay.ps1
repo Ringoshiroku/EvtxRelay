@@ -591,6 +591,28 @@ function Resolve-EvtxRelayAvailableIndexName {
     }
 }
 
+# returns the subset of the given field names that look like an ip address field, matched
+# case-insensitively against a fixed candidate list. elasticsearch has no built-in ip-shape
+# detection the way it does for dates and numbers, so this is what tells index creation which
+# fields need an explicit 'ip' mapping instead of falling back to plain text. a starting point
+# tuned from real-world field names, not a hard commitment, same as this project's other
+# heuristic thresholds
+function Get-EvtxRelayIpLikeFields {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$FieldNames
+    )
+    $ipLikeNames = @(
+        'ip', 'ipaddress', 'ip_address',
+        'srcip', 'src_ip', 'source_ip', 'sourceip',
+        'dstip', 'dst_ip', 'dest_ip', 'destip', 'destination_ip', 'destinationip',
+        'clientip', 'client_ip',
+        'remoteip', 'remote_ip', 'remote_addr',
+        'targetip', 'target_ip',
+        'localip', 'local_ip'
+    )
+    return @($FieldNames | Where-Object { $_ -in $ipLikeNames })
+}
+
 # creates the index if it doesn't exist yet, telling elasticsearch ahead of
 # time which column holds the date/time and what format it's in
 function Confirm-IndexWithTimestampMapping {
@@ -600,6 +622,7 @@ function Confirm-IndexWithTimestampMapping {
         [Parameter(Mandatory)][string]$IndexName,
         [string]$TimestampField,
         [string]$TimestampFormat,
+        [hashtable]$FieldTypeMappings,
         [switch]$SkipCertificateCheck
     )
 
@@ -618,15 +641,24 @@ function Confirm-IndexWithTimestampMapping {
     # tell elasticsearch up front instead of letting it guess. a wrong guess
     # silently turns the date column into plain text and breaks kibana's
     # time-based graphs later.
-    $body = @{}
+    $properties = @{}
     if ($TimestampField -and $TimestampFormat) {
-        $body = @{
-            mappings = @{
-                properties = @{
-                    $TimestampField = @{ type = 'date'; format = $TimestampFormat }
-                }
-            }
+        $properties[$TimestampField] = @{ type = 'date'; format = $TimestampFormat }
+    }
+
+    # elasticsearch has no built-in ip-shape detection the way it does for dates and numbers, so
+    # a field like this needs an explicit mapping to end up typed ip instead of plain text.
+    # ignore_malformed keeps one value that doesn't actually look like an ip from failing the
+    # whole document; that field just gets skipped on that one document instead
+    if ($FieldTypeMappings) {
+        foreach ($field in $FieldTypeMappings.Keys) {
+            $properties[$field] = @{ type = $FieldTypeMappings[$field]; ignore_malformed = $true }
         }
+    }
+
+    $body = @{}
+    if ($properties.Count -gt 0) {
+        $body = @{ mappings = @{ properties = $properties } }
     }
 
     Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName" -Method Put `
@@ -634,6 +666,43 @@ function Confirm-IndexWithTimestampMapping {
         -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
 
     return $true
+}
+
+# adds any of the given field-type mappings to an index that already exists, via a plain mapping
+# put. safe to call repeatedly: elasticsearch treats re-declaring a field with the same type as a
+# no-op, so this doesn't need to know what an earlier call already added
+function Add-EvtxRelayFieldTypeMappings {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][hashtable]$FieldTypeMappings,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    if ($FieldTypeMappings.Count -eq 0) { return }
+
+    $properties = @{}
+    foreach ($field in $FieldTypeMappings.Keys) {
+        $properties[$field] = @{ type = $FieldTypeMappings[$field]; ignore_malformed = $true }
+    }
+    $body = @{ properties = $properties }
+
+    try {
+        Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_mapping" -Method Put `
+            -Headers $AuthHeaders -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+    }
+    catch {
+        # a genuine conflict here (the field already exists on this index mapped as something
+        # else, from documents indexed before this feature shipped) means elasticsearch won't
+        # allow the type change. that's a real, if rare, possibility for an index that's been
+        # running a while, and it isn't worth failing the whole file over: the field just keeps
+        # whatever type it already has, same graceful-degradation pattern used elsewhere here
+        $detail = $_.ErrorDetails.Message
+        $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not add field type mapping(s) for $($FieldTypeMappings.Keys -join ', ') to '$IndexName' ($msg); those field(s) will keep whatever type the index already has for them."
+    }
 }
 
 
