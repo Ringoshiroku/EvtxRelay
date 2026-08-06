@@ -1216,6 +1216,21 @@ function Invoke-EvtxRelayFileUpload {
 # LOG FILE SUPPORT (-TOOL LOG)
 
 
+# returns the median of a list of numbers. used to judge whether a sample of lines looks like
+# key=value text without one unusually dense or sparse line skewing a plain average
+function Get-EvtxRelayMedian {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$Values
+    )
+    if ($Values.Count -eq 0) { return 0 }
+    $sorted = @($Values | Sort-Object)
+    $mid = [Math]::Floor($sorted.Count / 2)
+    if ($sorted.Count % 2 -eq 0) {
+        return ($sorted[$mid - 1] + $sorted[$mid]) / 2.0
+    }
+    return $sorted[$mid]
+}
+
 # figures out how to turn -tool log's raw lines into dated events: sends a sample of the file to
 # elasticsearch's own structure finder and, if it finds a usable per-line timestamp pattern, returns
 # the ingest pipeline processors needed to extract it. throws only when the file clearly isn't
@@ -1251,17 +1266,6 @@ function Resolve-EvtxRelayLogStructure {
         throw "This file doesn't look like an unstructured log to Elasticsearch (it detected '$($response.format)' instead). If it's actually delimited/tabular data, re-run with -Tool auto instead."
     }
 
-    $timestampField = $response.timestamp_field
-    if (-not $timestampField -or -not $response.ingest_pipeline) {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch could not find a reliable per-line timestamp in this file; every line will be indexed as a raw message with no timestamp."
-        return $null
-    }
-
-    $coveredCount = $response.field_stats.$timestampField.count
-    if ($coveredCount -and $response.num_messages_analyzed -and $coveredCount -lt $response.num_messages_analyzed) {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected timestamp pattern only matched $coveredCount of $($response.num_messages_analyzed) sampled lines; some lines may end up indexed without a timestamp."
-    }
-
     # field names this tool always sets itself; a real extracted field landing on one of these
     # would silently overwrite it, so field-extraction tiers below check candidate field names
     # against this list before building a pipeline, same defensive pattern as -folder mode's
@@ -1276,55 +1280,133 @@ function Resolve-EvtxRelayLogStructure {
     # key=value-style text, so it's only ever trusted for the timestamp, never for other fields
     $isTrustedPattern = $response.grok_pattern -match '^%\{[A-Z_]+\}$'
 
-    if ($isTrustedPattern) {
-        # keep every processor the trusted pattern defines, including 'convert': these are the
-        # pattern's own well-tested field definitions, not incidental captures, and elasticsearch's
-        # own response already sets ignore_missing on every convert step, so a field that's simply
-        # absent on some lines doesn't trip anything
-        $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
-            (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove', 'convert')
-        })
+    # key=value text (like firewall syslog) doesn't need grok at all, and elasticsearch's own
+    # ad-hoc pattern for this shape is unreliable (see resolve-evtxrelaylogstructure's header
+    # comment). a sample where most lines carry several key=value-looking tokens is judged
+    # kv-shaped independently of whatever grok pattern elasticsearch proposed
+    $kvTokenPattern = '\b[A-Za-z_][A-Za-z0-9_.]*=\S'
+    $kvLineCounts = @($sampleLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object {
+        @([regex]::Matches($_, $kvTokenPattern)).Count
+    })
+    $isKvShaped = (-not $isTrustedPattern) -and ((Get-EvtxRelayMedian -Values $kvLineCounts) -ge 3)
 
-        $collisionField = @($response.mappings.properties.PSObject.Properties.Name | Where-Object { $_ -cin @('source_file', 'grok_parse_failed') })
-        if ($collisionField.Count -gt 0) {
-            throw "Elasticsearch's detected pattern for this file extracts a field called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that field's source data before re-running, or use -Tool auto if this is really tabular data."
+    $timestampField = $response.timestamp_field
+    $keptProcessors = $null
+
+    if ($isKvShaped) {
+        # scan the same sample used for kv-shape detection to get a preview of the real field
+        # names a kv processor would extract, entirely client-side and before any pipeline is
+        # built, so a collision can be caught the same way the trusted-pattern tier catches one
+        $extractedKeys = New-Object System.Collections.Generic.List[string]
+        foreach ($line in $sampleLines) {
+            foreach ($m in [regex]::Matches($line, '\b([A-Za-z_][A-Za-z0-9_.]*)=\S')) {
+                $key = $m.Groups[1].Value
+                if (-not $extractedKeys.Contains($key)) { $extractedKeys.Add($key) }
+            }
         }
+
+        $collisionField = @($extractedKeys | Where-Object { $_ -cin $reservedFieldNames })
+        if ($collisionField.Count -gt 0) {
+            throw "This file's key=value fields include one called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that key in the source data before re-running."
+        }
+
+        # trim_value strips the surrounding double quotes many key=value formats wrap string
+        # values in (e.g. fortigate's action="close"), so the extracted field holds just close
+        $kvProcessors = New-Object System.Collections.Generic.List[object]
+        $kvProcessors.Add(@{ kv = @{ field = 'message'; field_split = '\s+'; value_split = '='; trim_value = '"' } })
+
+        # a date key and a time key together (fortigate's date=/time=) need concatenating into
+        # one string before elasticsearch's date processor can parse a real, full-precision
+        # timestamp. elasticsearch's own detection can't do this on its own (confirmed during
+        # design: it only captured the date portion, giving every line the same day-level
+        # timestamp with no time-of-day at all), and a script processor is the only ingest-
+        # pipeline tool that can combine two already-extracted fields into one
+        if (($extractedKeys -ccontains 'date') -and ($extractedKeys -ccontains 'time')) {
+            $kvProcessors.Add(@{ script = @{ source = "if (ctx.date != null && ctx.time != null) { ctx.evtxrelay_timestamp = ctx.date + ' ' + ctx.time }" } })
+            $kvProcessors.Add(@{ date = @{ field = 'evtxrelay_timestamp'; formats = @('yyyy-MM-dd HH:mm:ss', 'MM/dd/yyyy HH:mm:ss') } })
+            $kvProcessors.Add(@{ remove = @{ field = 'evtxrelay_timestamp'; ignore_missing = $true } })
+            $timestampField = 'date+time'
+        }
+        else {
+            $singleTimestampKey = @($extractedKeys | Where-Object { $_ -cin @('timestamp', 'time', 'datetime') })[0]
+            if ($singleTimestampKey) {
+                $kvProcessors.Add(@{ date = @{ field = $singleTimestampKey; formats = @('ISO8601', 'yyyy-MM-dd HH:mm:ss', 'MM/dd/yyyy HH:mm:ss') } })
+                $timestampField = $singleTimestampKey
+            }
+            else {
+                Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "This file's key=value fields don't include a recognizable date/time key; every line will be indexed with its extracted fields but no timestamp."
+                return $null
+            }
+        }
+
+        # a plain @() wrap around a List[object] hits a reproducible powershell 5.1 runtime bug on
+        # some hosts ("argument types do not match"); .toarray() avoids it and returns the same
+        # plain array shape the rest of this function already expects
+        $keptProcessors = $kvProcessors.ToArray()
     }
     else {
-        # only keep the processors that exist to find and set the timestamp. the structure finder's
-        # auto-derived grok pattern sometimes also captures an incidental field (e.g. a pid) and adds a
-        # 'convert' processor for it; that processor throwing on a line where the field isn't the type it
-        # expects would trip this pipeline's on_failure handler and mislabel a line whose timestamp parsed
-        # just fine as a parse failure, so anything other than grok/date/remove is dropped
-        $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
-            # PowerShell collapses a single-property object's .Name from an array to a plain
-            # scalar string, so indexing it directly with [0] would return the name's first
-            # character instead of the name itself. wrapping in @(...) forces array context first
-            (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove')
-        })
-    }
-
-    # elasticsearch's own date processor asks for a per-document 'event.timezone' field to resolve
-    # local-time logs (visible in the raw response as timezone: "{{ event.timezone }}"), which this
-    # tool's documents never set, so that reference would never resolve and every line's date parsing
-    # would fail, not just the ones that genuinely don't match. most log formats here (syslog-style)
-    # don't carry timezone info in the text anyway, so drop it and let the date processor fall back to
-    # elasticsearch's own default (utc) instead of failing outright
-    foreach ($proc in $keptProcessors) {
-        $procType = @($proc.PSObject.Properties.Name)[0]
-        if ($procType -eq 'date' -and $proc.date.PSObject.Properties.Name -contains 'timezone') {
-            $proc.date.PSObject.Properties.Remove('timezone')
-            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected date format needs a per-line timezone this file doesn't provide; timestamps will be parsed as UTC."
+        # everything from here on depends on elasticsearch's own timestamp/pipeline guess, which
+        # the kv tier above never needs since it builds its own pipeline from the raw sample
+        if (-not $timestampField -or -not $response.ingest_pipeline) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch could not find a reliable per-line timestamp in this file; every line will be indexed as a raw message with no timestamp."
+            return $null
         }
-    }
 
-    # if filtering above dropped every processor that would have set the timestamp, there's nothing
-    # left to write @timestamp, so fall back to the same untimed path as a structure-finder failure
-    # instead of creating a pipeline and a date-mapped index that never actually get a timestamp
-    $hasDate = @($keptProcessors | Where-Object { @($_.PSObject.Properties.Name)[0] -eq 'date' }).Count -gt 0
-    if (-not $hasDate) {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's suggested pipeline has no usable timestamp step for this file; every line will be indexed as a raw message with no timestamp."
-        return $null
+        $coveredCount = $response.field_stats.$timestampField.count
+        if ($coveredCount -and $response.num_messages_analyzed -and $coveredCount -lt $response.num_messages_analyzed) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected timestamp pattern only matched $coveredCount of $($response.num_messages_analyzed) sampled lines; some lines may end up indexed without a timestamp."
+        }
+
+        if ($isTrustedPattern) {
+            # keep every processor the trusted pattern defines, including 'convert': these are the
+            # pattern's own well-tested field definitions, not incidental captures, and elasticsearch's
+            # own response already sets ignore_missing on every convert step, so a field that's simply
+            # absent on some lines doesn't trip anything
+            $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
+                (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove', 'convert')
+            })
+
+            $collisionField = @($response.mappings.properties.PSObject.Properties.Name | Where-Object { $_ -cin @('source_file', 'grok_parse_failed') })
+            if ($collisionField.Count -gt 0) {
+                throw "Elasticsearch's detected pattern for this file extracts a field called '$($collisionField[0])', which collides with a field EvtxRelay sets itself. Rename that field's source data before re-running, or use -Tool auto if this is really tabular data."
+            }
+        }
+        else {
+            # only keep the processors that exist to find and set the timestamp. the structure finder's
+            # auto-derived grok pattern sometimes also captures an incidental field (e.g. a pid) and adds a
+            # 'convert' processor for it; that processor throwing on a line where the field isn't the type it
+            # expects would trip this pipeline's on_failure handler and mislabel a line whose timestamp parsed
+            # just fine as a parse failure, so anything other than grok/date/remove is dropped
+            $keptProcessors = @($response.ingest_pipeline.processors | Where-Object {
+                # PowerShell collapses a single-property object's .Name from an array to a plain
+                # scalar string, so indexing it directly with [0] would return the name's first
+                # character instead of the name itself. wrapping in @(...) forces array context first
+                (@($_.PSObject.Properties.Name)[0]) -in @('grok', 'date', 'remove')
+            })
+        }
+
+        # elasticsearch's own date processor asks for a per-document 'event.timezone' field to resolve
+        # local-time logs (visible in the raw response as timezone: "{{ event.timezone }}"), which this
+        # tool's documents never set, so that reference would never resolve and every line's date parsing
+        # would fail, not just the ones that genuinely don't match. most log formats here (syslog-style)
+        # don't carry timezone info in the text anyway, so drop it and let the date processor fall back to
+        # elasticsearch's own default (utc) instead of failing outright
+        foreach ($proc in $keptProcessors) {
+            $procType = @($proc.PSObject.Properties.Name)[0]
+            if ($procType -eq 'date' -and $proc.date.PSObject.Properties.Name -contains 'timezone') {
+                $proc.date.PSObject.Properties.Remove('timezone')
+                Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's detected date format needs a per-line timezone this file doesn't provide; timestamps will be parsed as UTC."
+            }
+        }
+
+        # if filtering above dropped every processor that would have set the timestamp, there's nothing
+        # left to write @timestamp, so fall back to the same untimed path as a structure-finder failure
+        # instead of creating a pipeline and a date-mapped index that never actually get a timestamp
+        $hasDate = @($keptProcessors | Where-Object { @($_.PSObject.Properties.Name)[0] -eq 'date' }).Count -gt 0
+        if (-not $hasDate) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's suggested pipeline has no usable timestamp step for this file; every line will be indexed as a raw message with no timestamp."
+            return $null
+        }
     }
 
     return [PSCustomObject]@{
