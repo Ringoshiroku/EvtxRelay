@@ -201,6 +201,14 @@ field would collide with a field EvtxRelay sets itself (`message`,
 instead of silently overwriting it, same as `-Tool auto`'s column-collision
 guards.
 
+Fields that look like an IP address (`srcip`, `source_ip`, `clientip`, and
+similar common names, matched case-insensitively) get an explicit `ip`
+mapping in the index, not just plain text — this applies to `-Tool auto`'s
+aliased `source_ip`/`dest_ip` columns too, and to every other CSV tool's
+columns that happen to carry one of these names. A value that doesn't
+actually look like a valid IP is simply skipped for that one field on
+that one row/line; it doesn't fail the whole upload.
+
 Any line that doesn't fit either of those two shapes still gets just a
 timestamp and `message`, exactly as before — this isn't a general-purpose
 field-extraction engine for arbitrary log formats, and formats that mix
