@@ -1183,9 +1183,16 @@ function Invoke-EvtxRelayFileUpload {
         -Tool $Tool -SubModule $SubModule -IndexName $IndexName -Exact:$Exact `
         -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
+    # elasticsearch has no built-in ip-shape detection, so a column matching a known ip-like
+    # name (source_ip, clientip, and so on) needs an explicit mapping to end up typed ip
+    $ipFieldTypeMappings = @{}
+    foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $SanitizedFields)) {
+        $ipFieldTypeMappings[$ipField] = 'ip'
+    }
+
     $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $IndexName -TimestampField $TimestampField -TimestampFormat $TimestampFormat `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -FieldTypeMappings $ipFieldTypeMappings -SkipCertificateCheck:$SkipCertificateCheck
     if ($indexCreated -and $TimestampField -and $TimestampFormat) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$TimestampField'."
     }
@@ -1776,6 +1783,7 @@ function Resolve-EvtxRelayBatchIndexSetup {
         [switch]$Exact,
         [string]$TimestampField,
         [string]$TimestampFormat,
+        [hashtable]$FieldTypeMappings,
         [switch]$SkipCertificateCheck,
         [Parameter(Mandatory)][string]$LogPath
     )
@@ -1786,7 +1794,7 @@ function Resolve-EvtxRelayBatchIndexSetup {
 
     $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $resolvedIndexName -TimestampField $TimestampField -TimestampFormat $TimestampFormat `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -FieldTypeMappings $FieldTypeMappings -SkipCertificateCheck:$SkipCertificateCheck
     if ($indexCreated -and $TimestampField -and $TimestampFormat) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$resolvedIndexName' with an explicit date mapping for '$TimestampField'."
     }
@@ -2102,6 +2110,7 @@ try {
         $detections = @{}
         $primaryFormats = New-Object System.Collections.Generic.List[string]
         $sharedTimestampField = $null
+        $sharedFieldTypeMappings = @{}
         foreach ($csvPath in $csvPaths) {
             Write-EvtxRelayLog -LogPath $LogPath -Message "--- Detecting '$csvPath' ---"
             try {
@@ -2114,6 +2123,9 @@ try {
                 if ($detection.TimestampFormat) {
                     $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
                     if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                }
+                foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $detection.SanitizedFields)) {
+                    $sharedFieldTypeMappings[$ipField] = 'ip'
                 }
             }
             catch {
@@ -2137,6 +2149,7 @@ try {
         $indexSetup = Resolve-EvtxRelayBatchIndexSetup -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
             -Tool $Tool -IndexName $IndexName -Exact:$ExactIndexName `
             -TimestampField $sharedTimestampField -TimestampFormat $unionedFormat `
+            -FieldTypeMappings $sharedFieldTypeMappings `
             -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
         $IndexName = $indexSetup.IndexName
 
