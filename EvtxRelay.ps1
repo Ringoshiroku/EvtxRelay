@@ -726,9 +726,30 @@ function Test-IndexColumnCoverage {
     $mappedFields = @()
     if ($props) { $mappedFields = @($props.PSObject.Properties.Name) }
 
-    # a column only shows up here once elasticsearch has seen a real value
-    # for it, so a missing column usually just means every row was blank
+    # a column only shows up here once elasticsearch has seen a real value for it, so a
+    # missing column usually just means every row was blank. the one exception is a field
+    # this tool explicitly mapped itself (like an ip-typed field, see
+    # get-evtxrelayignoredfieldcount below): that always shows up here even if every value
+    # for it turned out malformed and got dropped, so it can't catch that case
     return @($ExpectedFields | Where-Object { $mappedFields -notcontains $_ })
+}
+
+# counts documents in the index that have at least one field elasticsearch couldn't index as
+# its mapped type (tracked in the built-in _ignored metadata field) because ignore_malformed
+# let a bad value through instead of failing the whole document. the value is still there in
+# _source, it's just not searchable, filterable, or aggregatable on that field, and
+# test-indexcolumncoverage above can't catch this since the field still shows up in the mapping
+function Get-EvtxRelayIgnoredFieldCount {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$SkipCertificateCheck
+    )
+    $body = @{ query = @{ exists = @{ field = '_ignored' } } } | ConvertTo-Json -Depth 5
+    $countResponse = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_count" -Method Post `
+        -Headers $AuthHeaders -Body $body -ContentType 'application/json' -SkipCertificateCheck:$SkipCertificateCheck
+    return $countResponse.count
 }
 
 
@@ -1259,6 +1280,17 @@ function Invoke-EvtxRelayFileUpload {
         Write-EvtxRelayLog -LogPath $LogPath -Message "All $($SanitizedFields.Count) columns present in the index mapping. No column loss detected."
     }
 
+    # an ip-mapped column always shows up in the mapping above even if every value for it
+    # turned out malformed, so that check alone can't catch this. count it separately
+    $ignoredCount = $null
+    if ($ipFieldTypeMappings.Count -gt 0) {
+        $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+            -IndexName $IndexName -SkipCertificateCheck:$SkipCertificateCheck
+        if ($ignoredCount -gt 0) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$ignoredCount row(s) have a value in an ip-mapped column that isn't a valid ip address; the value is still there in that row, just not searchable or filterable on that column."
+        }
+    }
+
     # SET UP KIBANA
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
@@ -1275,6 +1307,9 @@ function Invoke-EvtxRelayFileUpload {
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
     Write-EvtxRelayLog -LogPath $LogPath -Message "Rows indexed:        $rowsIndexed / $totalRows"
     Write-EvtxRelayLog -LogPath $LogPath -Message "Column loss:         $(if ($missingColumns.Count -gt 0) { "$($missingColumns.Count) column(s) missing" } else { 'none' })"
+    if ($null -ne $ignoredCount) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount / $totalRows (valid but stored, not searchable on that column)"
+    }
     Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
     Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
 
@@ -1662,6 +1697,14 @@ function Invoke-EvtxRelayLogUpload {
         $unparsedCount = $countResponse.count
     }
 
+    # an ip-mapped field's value is still valid json, just not a valid ip, so it never trips
+    # grok_parse_failed; it needs its own count the same way that count needs its own
+    $ignoredCount = $null
+    if ($StructureResult -and $StructureResult.FieldTypeMappings.Count -gt 0) {
+        $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+            -IndexName $IndexName -SkipCertificateCheck:$SkipCertificateCheck
+    }
+
     # PRINT A SUMMARY
 
     Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
@@ -1669,6 +1712,9 @@ function Invoke-EvtxRelayLogUpload {
     Write-EvtxRelayLog -LogPath $LogPath -Message "Timestamp field:     $(if ($timestampField) { $timestampField } else { 'none (uploaded untimed)' })"
     if ($null -ne $unparsedCount) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Lines not parsed:    $unparsedCount / $totalLines (tagged grok_parse_failed, no timestamp)"
+    }
+    if ($null -ne $ignoredCount) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount / $totalLines (valid but stored, not searchable on that field)"
     }
     Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
     Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
@@ -2193,6 +2239,15 @@ try {
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
             -SkipCertificateCheck:$effectiveSkipCertCheck
 
+        # an ip-mapped column always shows up in the shared index's mapping even if every
+        # value for it across every file turned out malformed, so this needs its own count
+        # the same way -tool log's grok_parse_failed count does
+        $ignoredCount = $null
+        if ($sharedFieldTypeMappings.Count -gt 0) {
+            $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                -IndexName $IndexName -SkipCertificateCheck:$effectiveSkipCertCheck
+        }
+
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
         foreach ($r in $fileResults) {
             $line = "$($r.File): $($r.Status)"
@@ -2201,6 +2256,9 @@ try {
         }
         Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
         Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+        if ($null -ne $ignoredCount) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount row(s) in '$IndexName' (valid but stored, not searchable on that column)"
+        }
 
         $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
@@ -2292,6 +2350,15 @@ try {
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField '@timestamp' `
             -SkipCertificateCheck:$effectiveSkipCertCheck
 
+        # an ip-mapped field always shows up in the shared index's mapping even if every
+        # value for it across every file turned out malformed, so this needs its own count
+        # the same way each file's own grok_parse_failed count does
+        $ignoredCount = $null
+        if ($declaredFieldTypes.Count -gt 0) {
+            $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                -IndexName $IndexName -SkipCertificateCheck:$effectiveSkipCertCheck
+        }
+
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
         foreach ($r in $fileResults) {
             $line = "$($r.File): $($r.Status)"
@@ -2300,6 +2367,9 @@ try {
         }
         Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
         Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+        if ($null -ne $ignoredCount) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount line(s) in '$IndexName' (valid but stored, not searchable on that field)"
+        }
 
         $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='

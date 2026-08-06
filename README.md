@@ -83,6 +83,13 @@ table in `.evtxrelay\field-aliases.json`:
 | event ID | `event_id` |
 | process name | `process_name` |
 
+`source_ip` and `dest_ip` (and any other column that ends up with an
+ip-like name, whether through this table or on its own) get an explicit
+Elasticsearch `ip` mapping instead of plain text, the same as every other
+tool's ip-like columns; see the note under `-Tool log`'s field extraction
+below for exactly which names qualify and what happens to a value that
+isn't actually a valid IP.
+
 The first time `-Tool auto` runs, `field-aliases.json` is created with a
 built-in default list of spellings for each concept (for example `source_ip`
 matches `SourceIp`, `SourceIP`, `Source IP`, `src_ip`, `ClientIp`, and a few
@@ -136,7 +143,10 @@ holding the filename, so you can still filter or group by origin file in
 Kibana without losing the single unified timeline. If two files use
 different date formats for their timestamp column, EvtxRelay detects every
 file's format before creating the index and builds a mapping that accepts
-all of them, not just the first file's. A file that's genuinely unreadable
+all of them, not just the first file's. The same detect-everything-first
+pass also collects every file's ip-like column names, so the shared
+index's `ip` mappings cover every file's columns, not just the first
+file's. A file that's genuinely unreadable
 or empty, or hits a structure-finder column-naming collision, is logged
 and marked Failed, and is excluded from the folder; it doesn't abort the
 rest of the batch. A file where simply no timestamp column is found still
@@ -206,8 +216,11 @@ similar common names, matched case-insensitively) get an explicit `ip`
 mapping in the index, not just plain text — this applies to `-Tool auto`'s
 aliased `source_ip`/`dest_ip` columns too, and to every other CSV tool's
 columns that happen to carry one of these names. A value that doesn't
-actually look like a valid IP is simply skipped for that one field on
-that one row/line; it doesn't fail the whole upload.
+actually look like a valid IP is still stored and visible in that
+row/line, it's just not searchable, filterable, or sortable on that
+particular field; it doesn't fail the whole upload. The run's summary
+reports how many rows/lines this happened to, the same way it reports
+`grok_parse_failed` lines.
 
 Any line that doesn't fit either of those two shapes still gets just a
 timestamp and `message`, exactly as before — this isn't a general-purpose
@@ -241,7 +254,12 @@ index, two files that extract a same-named field with different apparent
 types (one file's `id=123` inferred as a number, another's
 `id=abc-forwarded` wanting to be a string) will show per-line indexing
 errors for whichever file's lines don't match the mapping the index
-already settled on.
+already settled on. Ip-like field names are the one exception: instead of
+failing per-line, EvtxRelay adds each newly-seen one to the shared
+index's mapping as it's discovered, so a later file introducing a `srcip`
+the first file didn't have still gets it typed correctly, and a genuine
+mapping conflict there degrades to a logged warning rather than per-line
+errors.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
 
