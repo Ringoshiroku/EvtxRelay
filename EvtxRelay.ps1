@@ -2541,9 +2541,9 @@ try {
         }
 
         # detect every file up front, before creating the index, same two-pass pattern -tool auto
-        # -folder already uses. unlike auto's per-file guessed date format though, iis's format is
-        # always the same fixed constant, so there's no format string to union here, just whether
-        # any file had a usable timestamp at all
+        # -folder already uses. unlike auto's per-file guessed date format, iis's format is always
+        # the same fixed constant, so there's no format string to union here, just whether any
+        # file had a usable timestamp at all
         $detections = @{}
         $sharedTimestampField = $null
         $sharedFieldTypeMappings = @{}
