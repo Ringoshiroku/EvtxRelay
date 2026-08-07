@@ -2533,6 +2533,115 @@ try {
             throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
         }
     }
+    elseif ($Tool -eq 'iis' -and $Folder) {
+        $excludedExtensions = @('.gz', '.zip', '.bz2')
+        $iisPaths = @(Get-ChildItem -LiteralPath $Folder -File | Where-Object { $excludedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Select-Object -ExpandProperty FullName)
+        if ($iisPaths.Count -eq 0) {
+            throw "No usable files found in '$Folder' (compressed files like .gz/.zip/.bz2 are skipped, not decompressed)."
+        }
+
+        # detect every file up front, before creating the index, same two-pass pattern -tool auto
+        # -folder already uses -- unlike auto's per-file guessed date format, iis's format is
+        # always the same fixed constant, so there's no format string to union here, just whether
+        # any file had a usable timestamp at all
+        $detections = @{}
+        $sharedTimestampField = $null
+        $sharedFieldTypeMappings = @{}
+        foreach ($iisPath in $iisPaths) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Detecting '$iisPath' ---"
+            try {
+                $parsed = ConvertFrom-EvtxRelayIisLogFile -File $iisPath -LogPath $LogPath
+                $detection = Resolve-EvtxRelayIisFileDetection -Parsed $parsed -File $iisPath -LogPath $LogPath
+                $detections[$iisPath] = $detection
+                if ($detection.TimestampField) { $sharedTimestampField = $detection.TimestampField }
+                foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $detection.SanitizedFields)) {
+                    $sharedFieldTypeMappings[$ipField] = 'ip'
+                }
+            }
+            catch {
+                if ($_.Exception.Message -like "No data rows found in *") {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$iisPath': no data rows."
+                    $detections[$iisPath] = 'EMPTY'
+                    continue
+                }
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Could not detect '$iisPath': $msg"
+                $detections[$iisPath] = $null
+            }
+        }
+
+        $sharedTimestampFormat = if ($sharedTimestampField) { $IisTimestampFormat } else { $null }
+
+        $indexSetup = Resolve-EvtxRelayBatchIndexSetup -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+            -Tool $Tool -IndexName $IndexName -Exact:$ExactIndexName `
+            -TimestampField $sharedTimestampField -TimestampFormat $sharedTimestampFormat `
+            -FieldTypeMappings $sharedFieldTypeMappings `
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+        $IndexName = $indexSetup.IndexName
+
+        $fileResults = New-Object System.Collections.Generic.List[object]
+        foreach ($iisPath in $iisPaths) {
+            $sourceFile = Split-Path -Leaf $iisPath
+            $detection = $detections[$iisPath]
+            if ($detection -eq 'EMPTY') {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Skipped (empty)' })
+                continue
+            }
+            if (-not $detection) {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+                continue
+            }
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Uploading '$iisPath' ---"
+            try {
+                $parsed = ConvertFrom-EvtxRelayIisLogFile -File $iisPath -LogPath $LogPath
+                $uploadResult = Invoke-EvtxRelayCsvBatchUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
+                    -SanitizedFields $detection.SanitizedFields -SourceFile $sourceFile -IndexName $IndexName `
+                    -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                    -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalRows })
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$iisPath': $msg"
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+        $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+        $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
+            -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        $ignoredCount = $null
+        if ($sharedFieldTypeMappings.Count -gt 0) {
+            $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                -IndexName $IndexName -SkipCertificateCheck:$effectiveSkipCertCheck
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
+        foreach ($r in $fileResults) {
+            $line = "$($r.File): $($r.Status)"
+            if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) rows into '$IndexName')" }
+            Write-EvtxRelayLog -LogPath $LogPath -Message $line
+        }
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+        if ($null -ne $ignoredCount) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount row(s) in '$IndexName' (valid but stored, not searchable on that column)"
+        }
+
+        $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+        if ($failedCount -gt 0) {
+            throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
+        }
+    }
     elseif ($Tool -eq 'log') {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Reading log file: $File"
         $lines = @(Get-Content -LiteralPath $File -Encoding UTF8)
