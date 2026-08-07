@@ -96,7 +96,7 @@ param(
     [string]$File,
 
     [Parameter(Mandatory)]
-    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log')]
+    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log', 'iis')]
     [string]$Tool,
 
     [string]$Folder,
@@ -196,6 +196,31 @@ $TimestampFormats = @{
     evtxecmd     = 'yyyy-MM-dd HH:mm:ss.SSSSSSS||strict_date_optional_time||epoch_millis'
     'apt-hunter' = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX||strict_date_optional_time||epoch_millis"
 }
+
+# iis's w3c extended field names are cryptic (c-ip is the client's own ip, s-ip is the server's
+# own listening ip) and don't match anything a user would guess in field-aliases.json, so this is
+# a fixed, built-in table instead of a user-editable one, same reasoning as the four known tools'
+# built-in timestamp knowledge above. source_ip/dest_ip are deliberately the same canonical names
+# -tool auto and the ip-type mapping heuristic already use, so those fields get typed ip for free
+$IisFieldNameMap = [ordered]@{
+    'c-ip'            = 'source_ip'
+    's-ip'            = 'dest_ip'
+    'cs-username'     = 'user_name'
+    'cs-method'       = 'method'
+    'cs-uri-stem'     = 'uri_stem'
+    'cs-uri-query'    = 'uri_query'
+    's-port'          = 'port'
+    'cs(User-Agent)'  = 'user_agent'
+    'cs(Referer)'     = 'referrer'
+    'sc-status'       = 'status'
+    'sc-substatus'    = 'substatus'
+    'sc-win32-status' = 'win32_status'
+    'time-taken'      = 'time_taken'
+}
+
+# iis's w3c extended format always writes date/time in this exact shape once the two columns are
+# concatenated, so unlike -tool auto's candidate-list guessing this is a known constant
+$IisTimestampFormat = 'yyyy-MM-dd HH:mm:ss||strict_date_optional_time||epoch_millis'
 
 # for -tool auto, there's no single known format to trust up front like the
 # four known tools above. instead, sample values from the resolved
@@ -1729,6 +1754,134 @@ function Invoke-EvtxRelayLogUpload {
 }
 
 
+# IIS LOG SUPPORT (-TOOL IIS)
+
+
+# reads an iis w3c extended log file and turns it into one record per data line. the real header
+# isn't row 1, it's a '#fields:' line that can repeat mid-file (confirmed in real iis output, not
+# hypothetical -- iis rewrites this block whenever logging is reconfigured or the log rolls while
+# the file stays open), so this walks the file as a small state machine instead of using
+# import-csv. a line that doesn't match the active column count is skipped, not fatal
+function ConvertFrom-EvtxRelayIisLogFile {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $lines = @(Get-Content -LiteralPath $File -Encoding UTF8)
+    $referenceColumns = $null
+    $currentColumns = $null
+    $records = New-Object System.Collections.Generic.List[object]
+    $malformedCount = 0
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+        if ($line.StartsWith('#Fields:')) {
+            $currentColumns = @(($line -replace '^#Fields:\s*', '') -split ' ' | Where-Object { $_ -ne '' })
+            if (-not $referenceColumns) {
+                $referenceColumns = $currentColumns
+            }
+            elseif (($currentColumns -join ' ') -ne ($referenceColumns -join ' ')) {
+                throw "'$File' has more than one '#Fields:' line with different columns (line $($i + 1)): first seen as '$($referenceColumns -join ' ')', now '$($currentColumns -join ' ')'. Split the file by hand before re-running; this tool won't guess how to reconcile two different schemas in one file."
+            }
+            continue
+        }
+        if ($line.StartsWith('#')) { continue }
+
+        if (-not $currentColumns) {
+            # a data line before any #fields: line has no schema to parse against yet
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "'$File' line $($i + 1) appears before any #Fields: line; skipped."
+            $malformedCount++
+            continue
+        }
+
+        $tokens = $line -split ' '
+        if ($tokens.Count -ne $currentColumns.Count) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "'$File' line $($i + 1) has $($tokens.Count) field(s), expected $($currentColumns.Count) for the active #Fields: columns; skipped."
+            $malformedCount++
+            continue
+        }
+
+        $record = [ordered]@{}
+        for ($c = 0; $c -lt $currentColumns.Count; $c++) {
+            if ($tokens[$c] -ne '-') { $record[$currentColumns[$c]] = $tokens[$c] }
+        }
+        if ($record.Contains('date') -and $record.Contains('time')) {
+            $record['event_timestamp'] = "$($record['date']) $($record['time'])"
+        }
+        $records.Add([PSCustomObject]$record)
+    }
+
+    if (-not $referenceColumns) {
+        throw "'$File' has no '#Fields:' line, so it doesn't look like an IIS W3C Extended log. If it's actually a CSV, use -Tool auto instead."
+    }
+
+    return [PSCustomObject]@{
+        Records            = $records.ToArray()
+        OriginalColumns    = $referenceColumns
+        MalformedLineCount = $malformedCount
+    }
+}
+
+
+# turns one iis file's raw parse (convertfrom-evtxrelayiislogfile) into the same
+# headermap/sanitizedfields/timestampfield/timestampformat shape every other csv-shaped tool
+# produces, so invoke-evtxrelayfileupload and the folder-mode batch functions need no changes
+# to accept -tool iis
+function Resolve-EvtxRelayIisFileDetection {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $parsed = ConvertFrom-EvtxRelayIisLogFile -File $File -LogPath $LogPath
+    if ($parsed.Records.Count -eq 0) {
+        throw "No data rows found in '$File'."
+    }
+    if ($parsed.MalformedLineCount -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($parsed.MalformedLineCount) line(s) in '$File' didn't match the active column count and were skipped."
+    }
+
+    $headerMap = [ordered]@{}
+    $untranslated = New-Object System.Collections.Generic.List[string]
+    foreach ($col in $parsed.OriginalColumns) {
+        if ($IisFieldNameMap.Contains($col)) {
+            $headerMap[$col] = $IisFieldNameMap[$col]
+        }
+        else {
+            $untranslated.Add($col)
+        }
+    }
+    if ($untranslated.Count -gt 0) {
+        $fallbackMap = Get-SanitizedHeaderMap -Headers $untranslated.ToArray()
+        foreach ($orig in $fallbackMap.Keys) { $headerMap[$orig] = $fallbackMap[$orig] }
+    }
+
+    $hasTimestamp = ($parsed.OriginalColumns -contains 'date') -and ($parsed.OriginalColumns -contains 'time')
+    if ($hasTimestamp) {
+        $headerMap['event_timestamp'] = 'event_timestamp'
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "'$File' has no 'date'/'time' columns in its #Fields: line; its rows will not be time-sorted."
+    }
+
+    $sanitizedFields = @($headerMap.Values)
+    if ($sanitizedFields -contains 'source_file') {
+        throw "Column 'source_file' collides with the field folder mode adds automatically to tag each row's source file. Rename the source column before re-running with -Folder."
+    }
+
+    return [PSCustomObject]@{
+        HeaderMap          = $headerMap
+        SanitizedFields    = $sanitizedFields
+        TimestampField     = if ($hasTimestamp) { 'event_timestamp' } else { $null }
+        TimestampFormat    = if ($hasTimestamp) { $IisTimestampFormat } else { $null }
+        MalformedLineCount = $parsed.MalformedLineCount
+    }
+}
+
+
 # FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG)
 
 
@@ -2020,7 +2173,7 @@ try {
             throw "-TimestampField isn't supported with -Tool apt-hunter, since each category file has its own differently-named date column. Omit it and let auto-detection handle each file."
         }
     }
-    elseif ($Tool -eq 'auto' -or $Tool -eq 'log') {
+    elseif ($Tool -eq 'auto' -or $Tool -eq 'log' -or $Tool -eq 'iis') {
         if ($File -and $Folder) {
             throw '-File and -Folder cannot both be given; pass one or the other.'
         }
@@ -2035,6 +2188,9 @@ try {
         }
         if ($Tool -eq 'log' -and $TimestampField) {
             throw "-TimestampField isn't supported with -Tool log; the timestamp always comes from Elasticsearch's structure finder as '@timestamp'."
+        }
+        if ($Tool -eq 'iis' -and $TimestampField) {
+            throw "-TimestampField isn't supported with -Tool iis; the timestamp always comes from concatenating IIS's own 'date' and 'time' columns."
         }
     }
     else {
@@ -2392,6 +2548,19 @@ try {
             -StructureResult $structureResult `
             -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+    }
+    elseif ($Tool -eq 'iis') {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Reading IIS log: $File"
+        $detection = Resolve-EvtxRelayIisFileDetection -File $File -LogPath $LogPath
+        $parsed = ConvertFrom-EvtxRelayIisLogFile -File $File -LogPath $LogPath
+
+        $uploadResult = Invoke-EvtxRelayFileUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
+            -SanitizedFields $detection.SanitizedFields -IndexName $IndexName -Tool $Tool -SubModule 'events' `
+            -Exact:$ExactIndexName -TimestampField $detection.TimestampField -TimestampFormat $detection.TimestampFormat `
+            -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
     }
