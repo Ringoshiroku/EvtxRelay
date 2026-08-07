@@ -19,11 +19,11 @@
     one, so use -Folder with -Tool apt-hunter instead of -File, and every csv
     in the folder gets uploaded into its own index in one run.
 
-    -Tool auto and -Tool log also accept -Folder, for a folder of same-kind
-    files (the same export tool run against several hosts, or a rotated log
-    directory). unlike apt-hunter, every file in the folder shares one index
-    instead of getting its own, with a source_file field on each document so
-    you can still tell which file a given row or line came from.
+    -Tool auto, -Tool log, and -Tool iis also accept -Folder, for a folder of
+    same-kind files (the same export tool run against several hosts, or a
+    rotated log directory). unlike apt-hunter, every file in the folder shares
+    one index instead of getting its own, with a source_file field on each
+    document so you can still tell which file a given row or line came from.
 
     kibana changed how data views are managed between versions, so this
     script tries the newer way first and automatically falls back to the
@@ -97,6 +97,14 @@
     #fields: line partway down the file, not row 1, and columns like c-ip/
     s-ip get translated to this project's usual source_ip/dest_ip names.
     see readme.md for the full column translation table.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\iis-logs -Tool iis
+
+    for a folder of iis logs, like a site's rotated log directory. every
+    file is detected independently, but they all land in one shared index
+    instead of one each, with a source_file field on every row so you can
+    still tell which file a given row came from.
 #>
 [CmdletBinding()]
 param(
@@ -1870,14 +1878,16 @@ function Resolve-EvtxRelayIisFileDetection {
     $hasTimestamp = ($Parsed.OriginalColumns -contains 'date') -and ($Parsed.OriginalColumns -contains 'time')
     if ($hasTimestamp) {
         $headerMap['event_timestamp'] = 'event_timestamp'
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Using 'event_timestamp' as the timestamp field for sorting."
     }
     else {
         Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "'$File' has no 'date'/'time' columns in its #Fields: line; its rows will not be time-sorted."
     }
 
     $sanitizedFields = @($headerMap.Values)
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
     if ($sanitizedFields -contains 'source_file') {
-        throw "Column 'source_file' collides with the field folder mode adds automatically to tag each row's source file. Rename the source column before re-running with -Folder."
+        throw "Column 'source_file' collides with the field folder mode adds automatically to tag each row's source file. Rename the source column before re-running."
     }
 
     return [PSCustomObject]@{
@@ -1890,7 +1900,7 @@ function Resolve-EvtxRelayIisFileDetection {
 }
 
 
-# FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG)
+# FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG / -TOOL IIS)
 
 
 # runs one -tool auto csv file through the same detection a single-file run would do (header
@@ -2203,7 +2213,7 @@ try {
     }
     else {
         if ($Folder) {
-            throw "-Folder is only used with -Tool apt-hunter, auto, or log; pass -File pointing at the CSV instead."
+            throw "-Folder is only used with -Tool apt-hunter, auto, log, or iis; pass -File pointing at the CSV instead."
         }
         if (-not $File) {
             throw '-File is required.'
@@ -2602,6 +2612,8 @@ try {
             }
             Write-EvtxRelayLog -LogPath $LogPath -Message "--- Uploading '$iisPath' ---"
             try {
+                # re-parses the file here instead of reusing the detection pass's Records, so folder
+                # mode only ever holds one file's rows in memory at a time, same as single-file mode
                 $parsed = ConvertFrom-EvtxRelayIisLogFile -File $iisPath -LogPath $LogPath
                 $uploadResult = Invoke-EvtxRelayCsvBatchUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
                     -SanitizedFields $detection.SanitizedFields -SourceFile $sourceFile -IndexName $IndexName `
@@ -2673,11 +2685,11 @@ try {
         $parsed = ConvertFrom-EvtxRelayIisLogFile -File $File -LogPath $LogPath
         $detection = Resolve-EvtxRelayIisFileDetection -Parsed $parsed -File $File -LogPath $LogPath
 
-        $uploadResult = Invoke-EvtxRelayFileUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
+        Invoke-EvtxRelayFileUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
             -SanitizedFields $detection.SanitizedFields -IndexName $IndexName -Tool $Tool -SubModule 'events' `
             -Exact:$ExactIndexName -TimestampField $detection.TimestampField -TimestampFormat $detection.TimestampFormat `
             -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-            -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+            -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
 
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
     }
