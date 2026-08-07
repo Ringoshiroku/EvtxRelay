@@ -1759,8 +1759,8 @@ function Invoke-EvtxRelayLogUpload {
 
 # reads an iis w3c extended log file and turns it into one record per data line. the real header
 # isn't row 1, it's a '#fields:' line that can repeat mid-file (confirmed in real iis output, not
-# hypothetical -- iis rewrites this block whenever logging is reconfigured or the log rolls while
-# the file stays open), so this walks the file as a small state machine instead of using
+# hypothetical, since iis rewrites this block whenever logging is reconfigured or the log rolls
+# while the file stays open), so this walks the file as a small state machine instead of using
 # import-csv. a line that doesn't match the active column count is skipped, not fatal
 function ConvertFrom-EvtxRelayIisLogFile {
     param(
@@ -1826,27 +1826,27 @@ function ConvertFrom-EvtxRelayIisLogFile {
 }
 
 
-# turns one iis file's raw parse (convertfrom-evtxrelayiislogfile) into the same
-# headermap/sanitizedfields/timestampfield/timestampformat shape every other csv-shaped tool
-# produces, so invoke-evtxrelayfileupload and the folder-mode batch functions need no changes
-# to accept -tool iis
+# turns one iis file's raw parse (convertfrom-evtxrelayiislogfile, passed in already done so the
+# file is only ever read from disk once) into the same headermap/sanitizedfields/timestampfield/
+# timestampformat shape every other csv-shaped tool produces, so invoke-evtxrelayfileupload and
+# the folder-mode batch functions need no changes to accept -tool iis
 function Resolve-EvtxRelayIisFileDetection {
     param(
+        [Parameter(Mandatory)]$Parsed,
         [Parameter(Mandatory)][string]$File,
         [Parameter(Mandatory)][string]$LogPath
     )
 
-    $parsed = ConvertFrom-EvtxRelayIisLogFile -File $File -LogPath $LogPath
-    if ($parsed.Records.Count -eq 0) {
+    if ($Parsed.Records.Count -eq 0) {
         throw "No data rows found in '$File'."
     }
-    if ($parsed.MalformedLineCount -gt 0) {
-        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($parsed.MalformedLineCount) line(s) in '$File' didn't match the active column count and were skipped."
+    if ($Parsed.MalformedLineCount -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($Parsed.MalformedLineCount) line(s) in '$File' didn't match the active column count and were skipped."
     }
 
     $headerMap = [ordered]@{}
     $untranslated = New-Object System.Collections.Generic.List[string]
-    foreach ($col in $parsed.OriginalColumns) {
+    foreach ($col in $Parsed.OriginalColumns) {
         if ($IisFieldNameMap.Contains($col)) {
             $headerMap[$col] = $IisFieldNameMap[$col]
         }
@@ -1859,7 +1859,7 @@ function Resolve-EvtxRelayIisFileDetection {
         foreach ($orig in $fallbackMap.Keys) { $headerMap[$orig] = $fallbackMap[$orig] }
     }
 
-    $hasTimestamp = ($parsed.OriginalColumns -contains 'date') -and ($parsed.OriginalColumns -contains 'time')
+    $hasTimestamp = ($Parsed.OriginalColumns -contains 'date') -and ($Parsed.OriginalColumns -contains 'time')
     if ($hasTimestamp) {
         $headerMap['event_timestamp'] = 'event_timestamp'
     }
@@ -1877,7 +1877,7 @@ function Resolve-EvtxRelayIisFileDetection {
         SanitizedFields    = $sanitizedFields
         TimestampField     = if ($hasTimestamp) { 'event_timestamp' } else { $null }
         TimestampFormat    = if ($hasTimestamp) { $IisTimestampFormat } else { $null }
-        MalformedLineCount = $parsed.MalformedLineCount
+        MalformedLineCount = $Parsed.MalformedLineCount
     }
 }
 
@@ -2551,10 +2551,10 @@ try {
 
         Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
     }
-    elseif ($Tool -eq 'iis') {
+    elseif ($Tool -eq 'iis' -and -not $Folder) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Reading IIS log: $File"
-        $detection = Resolve-EvtxRelayIisFileDetection -File $File -LogPath $LogPath
         $parsed = ConvertFrom-EvtxRelayIisLogFile -File $File -LogPath $LogPath
+        $detection = Resolve-EvtxRelayIisFileDetection -Parsed $parsed -File $File -LogPath $LogPath
 
         $uploadResult = Invoke-EvtxRelayFileUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
             -SanitizedFields $detection.SanitizedFields -IndexName $IndexName -Tool $Tool -SubModule 'events' `
