@@ -261,6 +261,62 @@ the first file didn't have still gets it typed correctly, and a genuine
 mapping conflict there degrades to a logged warning rather than per-line
 errors.
 
+### `-Tool iis`: for IIS W3C Extended web server logs
+
+    .\EvtxRelay.ps1 -File .\u_ex220302.log -Tool iis
+
+IIS's default W3C Extended log format isn't a CSV: it's space-delimited,
+and the real column list lives on a `#Fields:` line buried after a few
+other `#`-prefixed metadata lines, not on row 1. That `#Fields:` block can
+even repeat partway through a file (IIS rewrites it whenever logging is
+reconfigured or the log rolls while the file stays open) — `-Tool iis`
+handles all of this without needing `Import-Csv` at all.
+
+IIS's own column names are terse W3C notation, so they're translated to
+this project's friendlier, consistent names using a fixed built-in table
+(not `.evtxrelay\field-aliases.json` — these names are known and fixed,
+not guessed):
+
+| IIS column | Becomes |
+|---|---|
+| `c-ip` | `source_ip` (the client's IP, matching every other tool's `source_ip`) |
+| `s-ip` | `dest_ip` (the server's own listening IP, not the client's) |
+| `cs-username` | `user_name` |
+| `cs-method` | `method` |
+| `cs-uri-stem` | `uri_stem` |
+| `cs-uri-query` | `uri_query` |
+| `s-port` | `port` |
+| `cs(User-Agent)` | `user_agent` |
+| `cs(Referer)` | `referrer` |
+| `sc-status` | `status` |
+| `sc-substatus` | `substatus` |
+| `sc-win32-status` | `win32_status` |
+| `time-taken` | `time_taken` |
+
+Any column not in this table keeps its own (sanitized) name. `source_ip`/
+`dest_ip` get the same `ip`-type mapping every other tool's IP-named
+columns already get, automatically.
+
+IIS's `date` and `time` are separate columns; they're combined into a
+single `event_timestamp` field (and mapped as the Kibana time field) at
+upload time. A file whose `#Fields:` line doesn't include both `date` and
+`time` still uploads, just without time-sorting.
+
+Any value IIS writes as a literal `-` (its way of marking a blank field)
+is treated as absent, not stored as the string `-`.
+
+A data line that doesn't have the right number of fields for the active
+`#Fields:` columns is skipped with a warning, not fatal to the rest of the
+file. A file whose `#Fields:` block genuinely changes to a different
+column list partway through (not just repeats the same one) fails with a
+clear error — split it by hand before re-running. A file with no
+`#Fields:` line at all isn't IIS-shaped and fails with a clear error too;
+use `-Tool auto` if it's actually a CSV.
+
+`-Folder` works the same way it does for `-Tool log`: every file in the
+folder except compressed ones (`.gz`/`.zip`/`.bz2`) lands in one shared
+index, tagged with `source_file` per row.
+
 ### APT-Hunter is different: a folder of CSVs, not one file
 
 APT-Hunter writes one CSV per event category into a single output folder
@@ -450,15 +506,15 @@ your lab certificate is self-signed:
 | Parameter              | Required     | Default      | Purpose |
 |------------------------|---------------|--------------|---------|
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
-| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, or `log`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. |
-| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`) or `-Tool log` (every file except `.gz`/`.zip`/`.bz2`); for those two, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd`. |
+| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, `log`, or `iis`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. `iis` is for IIS W3C Extended web server logs. |
+| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`), `-Tool log`, or `-Tool iis` (every file except `.gz`/`.zip`/`.bz2` for the latter two); for those three, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd`. |
 | `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
 | `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
 | `-ElkHost`              | No            | saved value  | Elasticsearch and Kibana host, or the SSH target host if using `-UseSshTunnel`. Works the same whether it's a remote VPS or a lab machine on your local network. Also updates the saved value. |
 | `-ElasticPort`          | No            | `9200`       | Local port EvtxRelay connects to for Elasticsearch. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-BatchSize`            | No            | `2000`       | Rows sent per bulk request. |
-| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column) or `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself). |
+| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column), `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself), or `-Tool iis` (always the combined `date`+`time` columns). |
 | `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS or lab certificates. Turned on automatically when `-UseSshTunnel` is used. |
 | `-ResetCredential`      | No            | off          | Asks for your credentials again, for example after a password change. |
 | `-UseSshTunnel`         | No            | off (saved)  | Opens or reuses a background SSH tunnel to reach an Elasticsearch or Kibana that only listens on the VPS's own localhost. |

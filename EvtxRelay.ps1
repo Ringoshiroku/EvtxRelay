@@ -89,6 +89,14 @@
     up except compressed ones (.gz/.zip/.bz2, skipped rather than
     decompressed), each gets its own timestamp detection, and they all land
     in one shared index tagged with source_file.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -File .\u_ex220302.log -Tool iis
+
+    for an iis w3c extended web server log. the real header lives on a
+    #fields: line partway down the file, not row 1, and columns like c-ip/
+    s-ip get translated to this project's usual source_ip/dest_ip names.
+    see readme.md for the full column translation table.
 #>
 [CmdletBinding()]
 param(
