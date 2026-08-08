@@ -264,6 +264,12 @@ $IisTimestampFormat = 'yyyy-MM-dd HH:mm:ss||strict_date_optional_time||epoch_mil
 # already uses. this is what stands in for -tool auto's field-aliases.json here: -tool json stays
 # schema-agnostic pass-through (design spec §3), so there's no per-source alias table, just a
 # generic list of names real sources tend to use for their timestamp
+# how many levels of nesting a record keeps when it's turned into the bulk upload body
+# (convertto-bulkbody). anything nested deeper than this is replaced by the literal type name of
+# the object instead of its contents, so json detection also uses this number to warn when a file
+# is nested deeper than what will actually get uploaded
+$BulkBodyJsonDepth = 20
+
 $JsonTimestampKeyCandidates = @(
     'timestamp', 'time', '@timestamp', 'ts',
     'eventtime', 'event_time',
@@ -607,7 +613,7 @@ function ConvertTo-BulkBody {
     $actionLine = '{"index":{"_index":"' + $IndexName + '"}}'
     $lines = foreach ($rec in $Records) {
         $actionLine
-        ($rec | ConvertTo-Json -Compress -Depth 20)
+        ($rec | ConvertTo-Json -Compress -Depth $BulkBodyJsonDepth)
     }
     return ($lines -join "`n") + "`n"
 }
@@ -1963,7 +1969,14 @@ function ConvertTo-SanitizedJsonValue {
         return $out
     }
     if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        return @($Value | ForEach-Object { ConvertTo-SanitizedJsonValue -Value $_ })
+        # built element by element instead of through a pipeline, and returned with a leading comma,
+        # because a pipeline would turn an empty array into nothing at all (which serializes as an
+        # empty object), unwrap a one-element array down to the element itself, and flatten an array
+        # of arrays. all three would change the document's shape from what the source file had, and
+        # elasticsearch rejects later records whose field shape disagrees with the first one it saw
+        $items = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $Value) { $items.Add((ConvertTo-SanitizedJsonValue -Value $item)) }
+        return ,$items.ToArray()
     }
     return $Value
 }
@@ -1994,7 +2007,16 @@ function ConvertFrom-EvtxRelayJsonFile {
             $malformedCount++
             continue
         }
-        $rawObjects.Add($parsed)
+        if ($parsed -is [array]) {
+            # a whole top-level array written on one line parses fine as that single line's value,
+            # so the whole-file fallback below never fires for it. expand it here instead, the same
+            # way the fallback expands a pretty-printed top-level array, otherwise the array lands
+            # in the list as one element that isn't an object and gets thrown away as unusable
+            foreach ($item in $parsed) { $rawObjects.Add($item) }
+        }
+        else {
+            $rawObjects.Add($parsed)
+        }
     }
 
     if ($rawObjects.Count -eq 0 -or $rawObjects.Count -le $malformedCount) {
@@ -2176,6 +2198,13 @@ function Resolve-EvtxRelayJsonFileDetection {
         }
     }
 
+    # timestamp and ip-like detection both have to walk a record's whole nesting tree, which costs
+    # real time on a file with hundreds of thousands of records, so they only look at the first
+    # handful instead of every record, same sampling the timestamp format detection below already
+    # does. a field that only shows up later in the file can be missed, which is an accepted
+    # tradeoff since one file is assumed to hold one consistent kind of record
+    $sampleRecords = @($parsed.Records | Select-Object -First 20)
+
     # the first record with any candidate match decides the timestamp field for the whole file. a
     # file mixing several genuinely different record shapes with different timestamp key names
     # picks whichever shape's record happens to appear first. folder/single-file mode both
@@ -2183,7 +2212,7 @@ function Resolve-EvtxRelayJsonFileDetection {
     # tool in this script already makes about a same-kind batch of files
     $timestampField = $Override
     if (-not $timestampField) {
-        foreach ($record in $parsed.Records) {
+        foreach ($record in $sampleRecords) {
             $timestampField = Find-EvtxRelayJsonTimestampPath -Value $record -KeyNameCandidates $JsonTimestampKeyCandidates
             if ($timestampField) { break }
         }
@@ -2213,13 +2242,20 @@ function Resolve-EvtxRelayJsonFileDetection {
     }
 
     $ipLikePaths = New-Object System.Collections.Generic.List[string]
-    foreach ($record in $parsed.Records) {
+    $deepestNesting = 0
+    foreach ($record in $sampleRecords) {
         foreach ($path in (Get-EvtxRelayJsonIpLikePaths -Value $record)) {
             if (-not $ipLikePaths.Contains($path)) { $ipLikePaths.Add($path) }
+        }
+        foreach ($leaf in (Get-EvtxRelayJsonLeafFields -Value $record)) {
+            if ($leaf.Depth -gt $deepestNesting) { $deepestNesting = $leaf.Depth }
         }
     }
     if ($ipLikePaths.Count -gt 0) {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Detected ip-like field(s) in '$File': $($ipLikePaths -join ', ')"
+    }
+    if ($deepestNesting -gt $BulkBodyJsonDepth) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "'$File' has fields nested $deepestNesting levels deep, past the $BulkBodyJsonDepth levels that get uploaded. Fields below that depth may be missing from the indexed documents even though detection can see them here."
     }
 
     return [PSCustomObject]@{
