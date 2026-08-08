@@ -1921,7 +1921,7 @@ function Resolve-EvtxRelayIisFileDetection {
 # '_' (elasticsearch treats a dot in a field's own name as a nested-object separator, same reason
 # csv column names already get this treatment), checked for collisions only against sibling keys
 # in the same object, not globally across the whole document. nested objects/arrays are otherwise
-# left exactly as parsed, not flattened -- see the design spec's pass-through decision
+# left exactly as parsed, not flattened. see the design spec's pass-through decision
 # (specs/2026-08-07-json-log-support-design.md §3). converts pscustomobject to an ordered
 # hashtable along the way so downstream code (bulk body serialization, the leaf-field walker) has
 # one consistent shape to work with instead of two
@@ -1949,7 +1949,7 @@ function ConvertTo-SanitizedJsonValue {
 }
 
 # reads a json log file and returns one sanitized record per json object found. tries ndjson
-# first (one object per line -- the shape every real source this tool targets actually uses,
+# first (one object per line, the shape every real source this tool targets actually uses,
 # design spec §1: aws waf, crowdstrike fdr, and modsecurity's own one-object-per-file concurrent
 # logging mode are all covered by this). if literally no line parses on its own, falls back to
 # parsing the whole file as one json value, which covers a pretty-printed single object or a
@@ -1984,23 +1984,40 @@ function ConvertFrom-EvtxRelayJsonFile {
         # file can still have one line that happens to be valid json on its own (a short nested
         # object written on one line), so only checking for zero successes would wrongly treat
         # that one line as the whole file's only record instead of falling back to parsing it as
-        # one value; comparing the two counts catches that case too. reset the malformed count,
-        # since those per-line failures were an artifact of trying the wrong strategy, not real
-        # defects in the file
-        $malformedCount = 0
-        $rawObjects.Clear()
+        # one value. comparing the two counts catches that case too. keep the per-line results
+        # around in case the whole-file attempt below fails too, since a genuinely damaged ndjson
+        # file (most lines corrupted, a few still valid) should keep those valid lines instead of
+        # being discarded just because the fallback also couldn't make sense of it
+        $perLineObjects = $rawObjects.ToArray()
+        $perLineMalformedCount = $malformedCount
         $wholeFileText = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+        $wholeFileParsed = $null
+        $wholeFileParsedOk = $false
         try {
-            $parsed = $wholeFileText | ConvertFrom-Json -ErrorAction Stop
+            $wholeFileParsed = $wholeFileText | ConvertFrom-Json -ErrorAction Stop
+            $wholeFileParsedOk = $true
         }
         catch {
-            throw "'$File' doesn't look like JSON (tried one object per line, then the whole file as one value). If it's actually a CSV or plain-text log, use -Tool auto or -Tool log instead."
+            $wholeFileParsedOk = $false
         }
-        if ($parsed -is [array]) {
-            foreach ($item in $parsed) { $rawObjects.Add($item) }
+
+        if ($wholeFileParsedOk) {
+            $malformedCount = 0
+            $rawObjects.Clear()
+            if ($wholeFileParsed -is [array]) {
+                foreach ($item in $wholeFileParsed) { $rawObjects.Add($item) }
+            }
+            else {
+                $rawObjects.Add($wholeFileParsed)
+            }
+        }
+        elseif ($perLineObjects.Count -gt 0) {
+            $rawObjects.Clear()
+            foreach ($item in $perLineObjects) { $rawObjects.Add($item) }
+            $malformedCount = $perLineMalformedCount
         }
         else {
-            $rawObjects.Add($parsed)
+            throw "'$File' doesn't look like JSON (tried one object per line, then the whole file as one value). If it's actually a CSV or plain-text log, use -Tool auto or -Tool log instead."
         }
     }
 
@@ -2022,10 +2039,10 @@ function ConvertFrom-EvtxRelayJsonFile {
     }
 }
 
-# walks one sanitized json value (an ordered hashtable, array, or scalar -- the shape
+# walks one sanitized json value (an ordered hashtable, array, or scalar, which is the shape
 # convertto-sanitizedjsonvalue produces) and returns every leaf field as its dotted path, value,
 # and nesting depth. array elements share their parent's path (an array of objects like aws waf's
-# httprequest.headers doesn't get an index in the path -- detection only cares about field names,
+# httprequest.headers doesn't get an index in the path, since detection only cares about field names,
 # not position), so timestamp/ip-like detection can scan a whole record once instead of walking it
 # separately for each concern
 function Get-EvtxRelayJsonLeafFields {
@@ -2079,7 +2096,7 @@ function Find-EvtxRelayJsonTimestampPath {
 
 # reads the value at a dotted path out of one sanitized record, following each path segment
 # through nested hashtables. returns $null if the path doesn't exist in this particular record
-# (schemas can vary between records in the same file) or runs into an array partway through --
+# (schemas can vary between records in the same file) or runs into an array partway through.
 # none of this tool's named sources ever nest a timestamp inside an array, so that case isn't
 # handled, just treated as "not found"
 function Get-EvtxRelayJsonValueAtPath {
@@ -2117,7 +2134,7 @@ function Resolve-EvtxRelayJsonEpochFormat {
 # turns one json file's raw parse (convertfrom-evtxrelayjsonfile) into a timestamp field/format
 # and a list of ip-like dotted paths, the two things needed to create the index with the right
 # mappings before uploading. unlike every csv-shaped tool's detection function, there's no
-# headermap/sanitizedfields here -- records keep their own varying shape, nothing gets flattened
+# headermap/sanitizedfields here, since records keep their own varying shape, nothing gets flattened
 # (design spec §3)
 function Resolve-EvtxRelayJsonFileDetection {
     param(
@@ -2141,7 +2158,7 @@ function Resolve-EvtxRelayJsonFileDetection {
 
     # the first record with any candidate match decides the timestamp field for the whole file. a
     # file mixing several genuinely different record shapes with different timestamp key names
-    # picks whichever shape's record happens to appear first -- folder/single-file mode both
+    # picks whichever shape's record happens to appear first. folder/single-file mode both
     # assume "one file is one consistent kind of record," same assumption every other folder-mode
     # tool in this script already makes about a same-kind batch of files
     $timestampField = $Override
@@ -2195,7 +2212,7 @@ function Resolve-EvtxRelayJsonFileDetection {
 }
 
 # uploads one already-detected json file's records into its own index. same overall shape as
-# invoke-evtxrelaylogupload (no fixed column list, so no test-indexcolumncoverage call -- see
+# invoke-evtxrelaylogupload (no fixed column list, so no test-indexcolumncoverage call, see
 # global constraints), but simpler: there's no ingest pipeline, since parsing/sanitizing already
 # happened client-side in convertfrom-evtxrelayjsonfile instead of server-side via grok
 function Invoke-EvtxRelayJsonUpload {
