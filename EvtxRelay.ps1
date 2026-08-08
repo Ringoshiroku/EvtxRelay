@@ -2334,6 +2334,67 @@ function Invoke-EvtxRelayJsonUpload {
     }
 }
 
+# uploads one already-detected json file's records into folder mode's shared index, tagging every
+# top-level record with which file it came from. same overall shape as
+# invoke-evtxrelaylogbatchupload; no test-indexcolumncoverage call, same reason invoke-evtxrelay-
+# jsonupload above doesn't have one either
+function Invoke-EvtxRelayJsonBatchUpload {
+    param(
+        [Parameter(Mandatory)][array]$Records,
+        [Parameter(Mandatory)][string]$SourceFile,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $totalRecords = $Records.Count
+    $bulkErrors = New-Object System.Collections.Generic.List[object]
+
+    for ($start = 0; $start -lt $totalRecords; $start += $BatchSize) {
+        $end = [Math]::Min($start + $BatchSize, $totalRecords) - 1
+        $batch = @(foreach ($r in $Records[$start..$end]) { $r['source_file'] = $SourceFile; $r })
+        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $batch
+
+        $response = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_bulk" -Method Post `
+            -Headers $AuthHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        if ($response.errors) {
+            for ($j = 0; $j -lt $response.items.Count; $j++) {
+                $item = $response.items[$j].index
+                if ($item.error) {
+                    $detailParts = New-Object System.Collections.Generic.List[string]
+                    $errNode = $item.error
+                    while ($errNode) {
+                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
+                        $errNode = $errNode.caused_by
+                    }
+                    $bulkErrors.Add([PSCustomObject]@{
+                        Row    = $start + $j + 1
+                        Type   = $item.error.type
+                        Reason = ($detailParts -join ' <- caused by: ')
+                    })
+                }
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed records $($start + 1)-$($end + 1) of $totalRecords from '$SourceFile' into '$IndexName'."
+    }
+
+    $rowsIndexed = $totalRecords - $bulkErrors.Count
+    if ($bulkErrors.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) record(s) from '$SourceFile' failed to index:"
+        foreach ($e in $bulkErrors) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Record $($e.Row): $($e.Reason)"
+        }
+    }
+
+    return [PSCustomObject]@{ TotalRecords = $totalRecords; RowsIndexed = $rowsIndexed }
+}
+
 
 # FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG / -TOOL IIS)
 
@@ -3089,6 +3150,117 @@ try {
         Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
         if ($null -ne $ignoredCount) {
             Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount row(s) in '$IndexName' (valid but stored, not searchable on that column)"
+        }
+
+        $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+        if ($failedCount -gt 0) {
+            throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
+        }
+    }
+    elseif ($Tool -eq 'json' -and $Folder) {
+        $excludedExtensions = @('.gz', '.zip', '.bz2')
+        $jsonPaths = @(Get-ChildItem -LiteralPath $Folder -File | Where-Object { $excludedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Select-Object -ExpandProperty FullName)
+        if ($jsonPaths.Count -eq 0) {
+            throw "No usable files found in '$Folder' (compressed files like .gz/.zip/.bz2 are skipped, not decompressed)."
+        }
+
+        # detect every file up front, before creating the index, same two-pass pattern -tool auto
+        # -folder already uses, so the shared index's mappings cover every file's fields, not just
+        # the first file's
+        $detections = @{}
+        $primaryFormats = New-Object System.Collections.Generic.List[string]
+        $sharedTimestampField = $null
+        $sharedFieldTypeMappings = @{}
+        foreach ($jsonPath in $jsonPaths) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Detecting '$jsonPath' ---"
+            try {
+                $detection = Resolve-EvtxRelayJsonFileDetection -File $jsonPath -Override $TimestampField -LogPath $LogPath
+                $detections[$jsonPath] = $detection
+                if ($detection.TimestampField) { $sharedTimestampField = $detection.TimestampField }
+                if ($detection.TimestampFormat) {
+                    $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
+                    if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                }
+                foreach ($path in $detection.IpLikePaths) { $sharedFieldTypeMappings[$path] = 'ip' }
+            }
+            catch {
+                if ($_.Exception.Message -like "No usable JSON objects found in *") {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$jsonPath': no usable JSON objects."
+                    $detections[$jsonPath] = 'EMPTY'
+                    continue
+                }
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Could not detect '$jsonPath': $msg"
+                $detections[$jsonPath] = $null
+            }
+        }
+
+        $unionedFormat = $null
+        if ($primaryFormats.Count -gt 0) {
+            $unionedFormat = ($primaryFormats -join '||') + '||strict_date_optional_time||epoch_millis'
+        }
+
+        $indexSetup = Resolve-EvtxRelayBatchIndexSetup -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+            -Tool $Tool -IndexName $IndexName -Exact:$ExactIndexName `
+            -TimestampField $sharedTimestampField -TimestampFormat $unionedFormat `
+            -FieldTypeMappings $sharedFieldTypeMappings `
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+        $IndexName = $indexSetup.IndexName
+
+        $fileResults = New-Object System.Collections.Generic.List[object]
+        foreach ($jsonPath in $jsonPaths) {
+            $sourceFile = Split-Path -Leaf $jsonPath
+            $detection = $detections[$jsonPath]
+            if ($detection -eq 'EMPTY') {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Skipped (empty)' })
+                continue
+            }
+            if (-not $detection) {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+                continue
+            }
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Uploading '$jsonPath' ---"
+            try {
+                $uploadResult = Invoke-EvtxRelayJsonBatchUpload -Records $detection.Records -SourceFile $sourceFile -IndexName $IndexName `
+                    -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                    -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalRecords })
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$jsonPath': $msg"
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+        $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+        $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
+            -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        $ignoredCount = $null
+        if ($sharedFieldTypeMappings.Count -gt 0) {
+            $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                -IndexName $IndexName -SkipCertificateCheck:$effectiveSkipCertCheck
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
+        foreach ($r in $fileResults) {
+            $line = "$($r.File): $($r.Status)"
+            if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) records into '$IndexName')" }
+            Write-EvtxRelayLog -LogPath $LogPath -Message $line
+        }
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+        if ($null -ne $ignoredCount) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount record(s) in '$IndexName' (valid but stored, not searchable on that field)"
         }
 
         $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
