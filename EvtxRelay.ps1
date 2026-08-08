@@ -112,7 +112,7 @@ param(
     [string]$File,
 
     [Parameter(Mandatory)]
-    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log', 'iis')]
+    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log', 'iis', 'json')]
     [string]$Tool,
 
     [string]$Folder,
@@ -237,6 +237,20 @@ $IisFieldNameMap = [ordered]@{
 # iis's w3c extended format always writes date/time in this exact shape once the two columns are
 # concatenated, so unlike -tool auto's candidate-list guessing this is a known constant
 $IisTimestampFormat = 'yyyy-MM-dd HH:mm:ss||strict_date_optional_time||epoch_millis'
+
+# curated list of common json timestamp key names, checked recursively through a parsed record
+# (get-evtxrelayjsonleaffields walks every nesting level). matched case-insensitively against a
+# sanitized leaf key (the last dotted path segment), same convention the ip-like name list below
+# already uses. this is what stands in for -tool auto's field-aliases.json here: -tool json stays
+# schema-agnostic pass-through (design spec §3), so there's no per-source alias table, just a
+# generic list of names real sources tend to use for their timestamp
+$JsonTimestampKeyCandidates = @(
+    'timestamp', 'time', '@timestamp', 'ts',
+    'eventtime', 'event_time',
+    'time_stamp', 'timestamp_utc',
+    'datetime', 'date_time',
+    'occurred_at', 'created_at', 'event_date'
+)
 
 # for -tool auto, there's no single known format to trust up front like the
 # four known tools above. instead, sample values from the resolved
@@ -573,7 +587,7 @@ function ConvertTo-BulkBody {
     $actionLine = '{"index":{"_index":"' + $IndexName + '"}}'
     $lines = foreach ($rec in $Records) {
         $actionLine
-        ($rec | ConvertTo-Json -Compress -Depth 5)
+        ($rec | ConvertTo-Json -Compress -Depth 20)
     }
     return ($lines -join "`n") + "`n"
 }
@@ -1900,6 +1914,410 @@ function Resolve-EvtxRelayIisFileDetection {
 }
 
 
+# JSON LOG SUPPORT (-TOOL JSON)
+
+
+# recursively sanitizes one parsed json value: renames any object key containing a literal '.' to
+# '_' (elasticsearch treats a dot in a field's own name as a nested-object separator, same reason
+# csv column names already get this treatment), checked for collisions only against sibling keys
+# in the same object, not globally across the whole document. nested objects/arrays are otherwise
+# left exactly as parsed, not flattened -- see the design spec's pass-through decision
+# (specs/2026-08-07-json-log-support-design.md §3). converts pscustomobject to an ordered
+# hashtable along the way so downstream code (bulk body serialization, the leaf-field walker) has
+# one consistent shape to work with instead of two
+function ConvertTo-SanitizedJsonValue {
+    param(
+        $Value
+    )
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $out = [ordered]@{}
+        $seen = @{}
+        foreach ($prop in $Value.PSObject.Properties) {
+            $sanitized = $prop.Name -replace '\.', '_'
+            if ($seen.ContainsKey($sanitized)) {
+                throw "Key name collision after sanitization: '$($prop.Name)' and '$($seen[$sanitized])' both map to '$sanitized' within the same object. Rename one of the source keys before re-running."
+            }
+            $seen[$sanitized] = $prop.Name
+            $out[$sanitized] = ConvertTo-SanitizedJsonValue -Value $prop.Value
+        }
+        return $out
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return @($Value | ForEach-Object { ConvertTo-SanitizedJsonValue -Value $_ })
+    }
+    return $Value
+}
+
+# reads a json log file and returns one sanitized record per json object found. tries ndjson
+# first (one object per line -- the shape every real source this tool targets actually uses,
+# design spec §1: aws waf, crowdstrike fdr, and modsecurity's own one-object-per-file concurrent
+# logging mode are all covered by this). if literally no line parses on its own, falls back to
+# parsing the whole file as one json value, which covers a pretty-printed single object or a
+# genuine top-level array. a line that fails to parse in the first pass is skipped and counted,
+# not fatal to the rest of the file
+function ConvertFrom-EvtxRelayJsonFile {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $lines = @(Get-Content -LiteralPath $File -Encoding UTF8)
+    $rawObjects = New-Object System.Collections.Generic.List[object]
+    $malformedCount = 0
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try {
+            $parsed = $line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            $malformedCount++
+            continue
+        }
+        $rawObjects.Add($parsed)
+    }
+
+    if ($rawObjects.Count -eq 0 -or $rawObjects.Count -le $malformedCount) {
+        # at most half the lines parsed on their own (usually none at all). this is what a
+        # pretty-printed, multi-line single object (or an actual top-level array) looks like,
+        # since almost none of its lines are a complete json value by themselves. a pretty-printed
+        # file can still have one line that happens to be valid json on its own (a short nested
+        # object written on one line), so only checking for zero successes would wrongly treat
+        # that one line as the whole file's only record instead of falling back to parsing it as
+        # one value; comparing the two counts catches that case too. reset the malformed count,
+        # since those per-line failures were an artifact of trying the wrong strategy, not real
+        # defects in the file
+        $malformedCount = 0
+        $rawObjects.Clear()
+        $wholeFileText = Get-Content -LiteralPath $File -Raw -Encoding UTF8
+        try {
+            $parsed = $wholeFileText | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            throw "'$File' doesn't look like JSON (tried one object per line, then the whole file as one value). If it's actually a CSV or plain-text log, use -Tool auto or -Tool log instead."
+        }
+        if ($parsed -is [array]) {
+            foreach ($item in $parsed) { $rawObjects.Add($item) }
+        }
+        else {
+            $rawObjects.Add($parsed)
+        }
+    }
+
+    $records = New-Object System.Collections.Generic.List[object]
+    foreach ($obj in $rawObjects) {
+        # a line/array element that parsed as valid json but isn't an object (a bare string,
+        # number, or array) has nothing this tool can index as a document; skip it the same way a
+        # line that failed to parse at all gets skipped
+        if ($obj -isnot [System.Management.Automation.PSCustomObject]) {
+            $malformedCount++
+            continue
+        }
+        $records.Add((ConvertTo-SanitizedJsonValue -Value $obj))
+    }
+
+    return [PSCustomObject]@{
+        Records            = $records.ToArray()
+        MalformedLineCount = $malformedCount
+    }
+}
+
+# walks one sanitized json value (an ordered hashtable, array, or scalar -- the shape
+# convertto-sanitizedjsonvalue produces) and returns every leaf field as its dotted path, value,
+# and nesting depth. array elements share their parent's path (an array of objects like aws waf's
+# httprequest.headers doesn't get an index in the path -- detection only cares about field names,
+# not position), so timestamp/ip-like detection can scan a whole record once instead of walking it
+# separately for each concern
+function Get-EvtxRelayJsonLeafFields {
+    param(
+        $Value,
+        [string]$Path = ''
+    )
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            $childPath = if ($Path) { "$Path.$key" } else { $key }
+            $results.AddRange(@(Get-EvtxRelayJsonLeafFields -Value $Value[$key] -Path $childPath))
+        }
+    }
+    elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        foreach ($item in $Value) {
+            $results.AddRange(@(Get-EvtxRelayJsonLeafFields -Value $item -Path $Path))
+        }
+    }
+    elseif ($Path) {
+        $results.Add([PSCustomObject]@{ Path = $Path; Value = $Value; Depth = @($Path -split '\.').Count })
+    }
+    return $results.ToArray()
+}
+
+# recurses through one sanitized record and returns every dotted path whose own leaf key name
+# matches the shared ip-like name list (get-evtxrelayiplikefields), so a nested field like
+# httprequest.clientip gets the same ip-type mapping a flat csv column named clientip already gets
+function Get-EvtxRelayJsonIpLikePaths {
+    param(
+        [Parameter(Mandatory)]$Value
+    )
+    $paths = @(Get-EvtxRelayJsonLeafFields -Value $Value | ForEach-Object { $_.Path } | Sort-Object -Unique)
+    $leafNames = @($paths | ForEach-Object { (@($_ -split '\.'))[-1] })
+    $ipLikeNames = Get-EvtxRelayIpLikeFields -FieldNames $leafNames
+    return @($paths | Where-Object { (@($_ -split '\.'))[-1] -in $ipLikeNames })
+}
+
+# recurses through one sanitized record looking for a leaf key name from the curated timestamp
+# candidate list, preferring the shallowest match if more than one candidate name is present in
+# the same record
+function Find-EvtxRelayJsonTimestampPath {
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string[]]$KeyNameCandidates
+    )
+    $candidateLeaves = @(Get-EvtxRelayJsonLeafFields -Value $Value | Where-Object { (@($_.Path -split '\.'))[-1] -in $KeyNameCandidates })
+    if ($candidateLeaves.Count -eq 0) { return $null }
+    return ($candidateLeaves | Sort-Object Depth | Select-Object -First 1).Path
+}
+
+# reads the value at a dotted path out of one sanitized record, following each path segment
+# through nested hashtables. returns $null if the path doesn't exist in this particular record
+# (schemas can vary between records in the same file) or runs into an array partway through --
+# none of this tool's named sources ever nest a timestamp inside an array, so that case isn't
+# handled, just treated as "not found"
+function Get-EvtxRelayJsonValueAtPath {
+    param(
+        $Value,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $current = $Value
+    foreach ($segment in (@($Path -split '\.'))) {
+        if ($current -is [System.Collections.IDictionary] -and $current.Contains($segment)) {
+            $current = $current[$segment]
+        }
+        else {
+            return $null
+        }
+    }
+    return $current
+}
+
+# classifies a numeric timestamp sample as seconds or milliseconds since epoch by magnitude
+# instead of trying to parse it as a date: today's date is roughly 1.77e12 in milliseconds and
+# 1.77e9 in seconds, so a wide, simple threshold reliably tells them apart across any date from
+# the unix epoch through the next several centuries without needing per-value parsing
+function Resolve-EvtxRelayJsonEpochFormat {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][double[]]$SampleValues
+    )
+    $samples = @($SampleValues | Select-Object -First 20)
+    if ($samples.Count -eq 0) { return $null }
+    if (@($samples | Where-Object { $_ -ge 1e11 }).Count -eq $samples.Count) { return 'epoch_millis' }
+    if (@($samples | Where-Object { $_ -ge 1e8 -and $_ -lt 1e11 }).Count -eq $samples.Count) { return 'epoch_second' }
+    return $null
+}
+
+# turns one json file's raw parse (convertfrom-evtxrelayjsonfile) into a timestamp field/format
+# and a list of ip-like dotted paths, the two things needed to create the index with the right
+# mappings before uploading. unlike every csv-shaped tool's detection function, there's no
+# headermap/sanitizedfields here -- records keep their own varying shape, nothing gets flattened
+# (design spec §3)
+function Resolve-EvtxRelayJsonFileDetection {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [string]$Override,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $parsed = ConvertFrom-EvtxRelayJsonFile -File $File -LogPath $LogPath
+    if ($parsed.Records.Count -eq 0) {
+        throw "No usable JSON objects found in '$File'."
+    }
+    if ($parsed.MalformedLineCount -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($parsed.MalformedLineCount) line(s)/element(s) in '$File' could not be read as a JSON object and were skipped."
+    }
+    foreach ($record in $parsed.Records) {
+        if ($record.Contains('source_file')) {
+            throw "'$File' has a top-level 'source_file' field, which collides with the field folder mode adds automatically to tag each row's source file. Rename the source field before re-running with -Folder."
+        }
+    }
+
+    # the first record with any candidate match decides the timestamp field for the whole file. a
+    # file mixing several genuinely different record shapes with different timestamp key names
+    # picks whichever shape's record happens to appear first -- folder/single-file mode both
+    # assume "one file is one consistent kind of record," same assumption every other folder-mode
+    # tool in this script already makes about a same-kind batch of files
+    $timestampField = $Override
+    if (-not $timestampField) {
+        foreach ($record in $parsed.Records) {
+            $timestampField = Find-EvtxRelayJsonTimestampPath -Value $record -KeyNameCandidates $JsonTimestampKeyCandidates
+            if ($timestampField) { break }
+        }
+    }
+
+    $timestampFormat = $null
+    if ($timestampField) {
+        $sampleValues = @($parsed.Records | ForEach-Object { Get-EvtxRelayJsonValueAtPath -Value $_ -Path $timestampField } | Where-Object { $null -ne $_ } | Select-Object -First 20)
+        $numericSamples = @($sampleValues | Where-Object { $_ -is [double] -or $_ -is [long] -or $_ -is [int] })
+        if ($sampleValues.Count -gt 0 -and $numericSamples.Count -eq $sampleValues.Count) {
+            $epochFormat = Resolve-EvtxRelayJsonEpochFormat -SampleValues @($numericSamples | ForEach-Object { [double]$_ })
+            if ($epochFormat) { $timestampFormat = "$epochFormat||strict_date_optional_time||epoch_millis" }
+        }
+        elseif ($sampleValues.Count -gt 0) {
+            $timestampFormat = Resolve-EvtxRelayTimestampFormat -SampleValues @($sampleValues | ForEach-Object { [string]$_ }) -FormatCandidates $AutoTimestampFormatCandidates
+        }
+
+        if ($timestampFormat) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$timestampField' as the timestamp field, format $timestampFormat."
+        }
+        else {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Found timestamp field '$timestampField' in '$File' but couldn't confidently detect its date format from sample values; its rows will rely on whatever date mapping the index ends up with, if any."
+        }
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not find a timestamp field in '$File'. Pass -TimestampField (a dotted path, e.g. 'transaction.time_stamp') to override."
+    }
+
+    $ipLikePaths = New-Object System.Collections.Generic.List[string]
+    foreach ($record in $parsed.Records) {
+        foreach ($path in (Get-EvtxRelayJsonIpLikePaths -Value $record)) {
+            if (-not $ipLikePaths.Contains($path)) { $ipLikePaths.Add($path) }
+        }
+    }
+    if ($ipLikePaths.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Detected ip-like field(s) in '$File': $($ipLikePaths -join ', ')"
+    }
+
+    return [PSCustomObject]@{
+        Records            = $parsed.Records
+        TimestampField     = $timestampField
+        TimestampFormat    = $timestampFormat
+        IpLikePaths        = $ipLikePaths.ToArray()
+        MalformedLineCount = $parsed.MalformedLineCount
+    }
+}
+
+# uploads one already-detected json file's records into its own index. same overall shape as
+# invoke-evtxrelaylogupload (no fixed column list, so no test-indexcolumncoverage call -- see
+# global constraints), but simpler: there's no ingest pipeline, since parsing/sanitizing already
+# happened client-side in convertfrom-evtxrelayjsonfile instead of server-side via grok
+function Invoke-EvtxRelayJsonUpload {
+    param(
+        [Parameter(Mandatory)][array]$Records,
+        [Parameter(Mandatory)][string]$IndexName,
+        [Parameter(Mandatory)][string]$Tool,
+        [switch]$Exact,
+        [string]$TimestampField,
+        [string]$TimestampFormat,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$IpLikePaths,
+        [int]$MalformedLineCount = 0,
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $IndexName = Resolve-EvtxRelayAvailableIndexName -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -Tool $Tool -SubModule 'events' -IndexName $IndexName -Exact:$Exact `
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+
+    $ipFieldTypeMappings = @{}
+    foreach ($path in $IpLikePaths) { $ipFieldTypeMappings[$path] = 'ip' }
+
+    $indexCreated = Confirm-IndexWithTimestampMapping -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -TimestampField $TimestampField -TimestampFormat $TimestampFormat `
+        -FieldTypeMappings $ipFieldTypeMappings -SkipCertificateCheck:$SkipCertificateCheck
+    if ($indexCreated -and $TimestampField -and $TimestampFormat) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Created index '$IndexName' with an explicit date mapping for '$TimestampField'."
+    }
+
+    # UPLOAD THE DATA IN BATCHES
+
+    $totalRecords = $Records.Count
+    $bulkErrors = New-Object System.Collections.Generic.List[object]
+
+    for ($start = 0; $start -lt $totalRecords; $start += $BatchSize) {
+        $end = [Math]::Min($start + $BatchSize, $totalRecords) - 1
+        $batch = $Records[$start..$end]
+        $bulkBody = ConvertTo-BulkBody -IndexName $IndexName -Records $batch
+
+        $response = Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName/_bulk" -Method Post `
+            -Headers $AuthHeaders -Body $bulkBody -ContentType 'application/x-ndjson' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        if ($response.errors) {
+            for ($j = 0; $j -lt $response.items.Count; $j++) {
+                $item = $response.items[$j].index
+                if ($item.error) {
+                    $detailParts = New-Object System.Collections.Generic.List[string]
+                    $errNode = $item.error
+                    while ($errNode) {
+                        $detailParts.Add("[$($errNode.type)] $($errNode.reason)")
+                        $errNode = $errNode.caused_by
+                    }
+                    $bulkErrors.Add([PSCustomObject]@{
+                        Row    = $start + $j + 1
+                        Type   = $item.error.type
+                        Reason = ($detailParts -join ' <- caused by: ')
+                    })
+                }
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Indexed records $($start + 1)-$($end + 1) of $totalRecords into '$IndexName'."
+    }
+
+    $rowsIndexed = $totalRecords - $bulkErrors.Count
+    if ($bulkErrors.Count -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$($bulkErrors.Count) record(s) failed to index:"
+        foreach ($e in $bulkErrors) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "  Record $($e.Row): $($e.Reason)"
+        }
+    }
+
+    # SET UP KIBANA
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+    $dataView = Confirm-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -TimestampField $TimestampField -SkipCertificateCheck:$SkipCertificateCheck
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+    $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $TimestampField `
+        -SkipCertificateCheck:$SkipCertificateCheck
+
+    $ignoredCount = $null
+    if ($ipFieldTypeMappings.Count -gt 0) {
+        $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+            -IndexName $IndexName -SkipCertificateCheck:$SkipCertificateCheck
+        if ($ignoredCount -gt 0) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$ignoredCount record(s) have a value in an ip-mapped field that isn't a valid ip address; the value is still there, just not searchable or filterable on that field."
+        }
+    }
+
+    # PRINT A SUMMARY
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message '=== Summary ==='
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Records indexed:     $rowsIndexed / $totalRecords"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Timestamp field:     $(if ($TimestampField) { $TimestampField } else { 'none (uploaded untimed)' })"
+    if ($MalformedLineCount -gt 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Lines not parsed:    $MalformedLineCount (not a valid JSON object, skipped)"
+    }
+    if ($null -ne $ignoredCount) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount / $totalRecords (valid but stored, not searchable on that field)"
+    }
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+
+    return [PSCustomObject]@{
+        IndexName          = $IndexName
+        TotalRecords       = $totalRecords
+        RowsIndexed        = $rowsIndexed
+        DataViewCreated    = $dataView.Created
+        SavedSearchCreated = $savedSearch.Created
+    }
+}
+
+
 # FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG / -TOOL IIS)
 
 
@@ -2191,7 +2609,7 @@ try {
             throw "-TimestampField isn't supported with -Tool apt-hunter, since each category file has its own differently-named date column. Omit it and let auto-detection handle each file."
         }
     }
-    elseif ($Tool -eq 'auto' -or $Tool -eq 'log' -or $Tool -eq 'iis') {
+    elseif ($Tool -eq 'auto' -or $Tool -eq 'log' -or $Tool -eq 'iis' -or $Tool -eq 'json') {
         if ($File -and $Folder) {
             throw '-File and -Folder cannot both be given; pass one or the other.'
         }
@@ -2213,7 +2631,7 @@ try {
     }
     else {
         if ($Folder) {
-            throw "-Folder is only used with -Tool apt-hunter, auto, log, or iis; pass -File pointing at the CSV instead."
+            throw "-Folder is only used with -Tool apt-hunter, auto, log, iis, or json; pass -File pointing at the CSV instead."
         }
         if (-not $File) {
             throw '-File is required.'
@@ -2688,6 +3106,18 @@ try {
         Invoke-EvtxRelayFileUpload -Records $parsed.Records -HeaderMap $detection.HeaderMap `
             -SanitizedFields $detection.SanitizedFields -IndexName $IndexName -Tool $Tool -SubModule 'events' `
             -Exact:$ExactIndexName -TimestampField $detection.TimestampField -TimestampFormat $detection.TimestampFormat `
+            -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+    }
+    elseif ($Tool -eq 'json' -and -not $Folder) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Reading JSON file: $File"
+        $detection = Resolve-EvtxRelayJsonFileDetection -File $File -Override $TimestampField -LogPath $LogPath
+
+        Invoke-EvtxRelayJsonUpload -Records $detection.Records -IndexName $IndexName -Tool $Tool -Exact:$ExactIndexName `
+            -TimestampField $detection.TimestampField -TimestampFormat $detection.TimestampFormat `
+            -IpLikePaths $detection.IpLikePaths -MalformedLineCount $detection.MalformedLineCount `
             -ElasticBaseUri $elasticBaseUri -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -BatchSize $BatchSize -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath | Out-Null
 
