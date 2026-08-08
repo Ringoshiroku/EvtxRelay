@@ -19,11 +19,12 @@
     one, so use -Folder with -Tool apt-hunter instead of -File, and every csv
     in the folder gets uploaded into its own index in one run.
 
-    -Tool auto, -Tool log, and -Tool iis also accept -Folder, for a folder of
-    same-kind files (the same export tool run against several hosts, or a
-    rotated log directory). unlike apt-hunter, every file in the folder shares
-    one index instead of getting its own, with a source_file field on each
-    document so you can still tell which file a given row or line came from.
+    -Tool auto, -Tool log, -Tool iis, and -Tool json also accept -Folder, for a
+    folder of same-kind files (the same export tool run against several hosts,
+    or a rotated log directory). unlike apt-hunter, every file in the folder
+    shares one index instead of getting its own, with a source_file field on
+    each document so you can still tell which file a given row or line came
+    from.
 
     kibana changed how data views are managed between versions, so this
     script tries the newer way first and automatically falls back to the
@@ -105,6 +106,25 @@
     file is detected independently, but they all land in one shared index
     instead of one each, with a source_file field on every row so you can
     still tell which file a given row came from.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -File .\waf-logs.json -Tool json
+
+    for a json-based log source (aws waf, modsecurity json audit log, an xdr
+    platform export like crowdstrike fdr) -- one json object per line, or a
+    single object/array in the whole file. nested objects and arrays are kept
+    nested instead of being flattened, and a timestamp field is found by
+    checking a curated list of common key names at every nesting level. pass
+    -timestampfield with a dotted path (e.g. transaction.time_stamp) if the
+    guess is wrong or missing.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\waf-logs -Tool json
+
+    for a folder of json log files, like several days' worth of the same
+    export. every file is detected independently, but they all land in one
+    shared index instead of one each, with a source_file field on every
+    record so you can still tell which file a given record came from.
 #>
 [CmdletBinding()]
 param(

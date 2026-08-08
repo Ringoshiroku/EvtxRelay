@@ -317,6 +317,58 @@ use `-Tool auto` if it's actually a CSV.
 folder except compressed ones (`.gz`/`.zip`/`.bz2`) lands in one shared
 index, tagged with `source_file` per row.
 
+### `-Tool json`: for JSON-based log sources
+
+    .\EvtxRelay.ps1 -File .\waf-logs.json -Tool json
+
+For JSON-shaped event sources that aren't tabular at all: AWS WAF logs,
+ModSecurity's JSON audit log, or an XDR platform export/stream like
+CrowdStrike Falcon Data Replicator. The expected shape is one JSON object per
+line (NDJSON) -- what every real source above actually ships as. If the whole
+file turns out to have zero valid one-line JSON objects, EvtxRelay falls back
+to parsing the entire file as one JSON value instead, which also covers a
+pretty-printed single object (for example ModSecurity's JSON output, which
+requires "concurrent" logging mode and writes one object per file) or a
+genuine top-level JSON array.
+
+Unlike every other tool here, nested objects and arrays are **not**
+flattened into synthetic field names -- they're indexed close to as-received,
+since Elasticsearch stores nested JSON natively and Kibana's Discover view can
+expand it. The only change made to a record's own shape is the same one every
+other tool already makes to column names: a key containing a literal `.` gets
+it replaced with `_`, since Elasticsearch treats a dot in a field's own name
+as a nested-object separator.
+
+A timestamp field is found by checking a built-in list of common key names
+(`timestamp`, `time`, `@timestamp`, `ts`, and similar) against every nesting
+level of the first record that has one, not just the top level -- so AWS
+WAF's top-level `timestamp` and ModSecurity's nested `transaction.time_stamp`
+are both found the same way, no per-source configuration needed. A numeric
+value is classified as seconds or milliseconds since epoch by its magnitude; a
+string value is tried against the same curated date-format list `-Tool auto`
+uses. Pass `-TimestampField` with a dotted path (e.g.
+`-TimestampField transaction.time_stamp`) to override the guess -- this is the
+one tool besides the four CSV-shaped ones where `-TimestampField` is
+supported.
+
+Fields that look like an IP address (matched by leaf key name, the same list
+every other tool uses -- `clientIp`, `srcip`, and similar) get an explicit
+`ip` mapping automatically, no matter how deeply nested they are.
+
+A line that isn't valid JSON is skipped with a warning and a running count,
+not fatal to the rest of the file. A file that's genuinely not JSON at all
+(no valid line, and the whole-file fallback also fails to parse) fails with a
+clear error; use `-Tool auto` or `-Tool log` instead if it's actually a CSV or
+a plain-text log.
+
+`-Folder` works the same way it does for `-Tool log`/`-Tool iis`: every file
+in the folder except compressed ones (`.gz`/`.zip`/`.bz2`, skipped rather than
+decompressed) lands in one shared index, tagged with `source_file` per
+record. As with those tools, folder mode is for a batch of *same-kind* files
+(several days of the same export, for example) -- a folder mixing genuinely
+different JSON shapes will still upload, but only the first file's detected
+timestamp field name is used as the shared index's time field.
+
 ### APT-Hunter is different: a folder of CSVs, not one file
 
 APT-Hunter writes one CSV per event category into a single output folder
@@ -506,15 +558,15 @@ your lab certificate is self-signed:
 | Parameter              | Required     | Default      | Purpose |
 |------------------------|---------------|--------------|---------|
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
-| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, `log`, or `iis`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. `iis` is for IIS W3C Extended web server logs. |
-| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`), `-Tool log`, or `-Tool iis` (every file except `.gz`/`.zip`/`.bz2` for the latter two); for those three, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd`. |
+| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, `log`, `iis`, or `json`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. `iis` is for IIS W3C Extended web server logs. `json` is for JSON-based log sources (NDJSON, one JSON object per line); nested objects/arrays are kept nested, not flattened. |
+| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`), `-Tool log`, `-Tool iis`, or `-Tool json` (every file except `.gz`/`.zip`/`.bz2` for the latter three); for those four, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd`. |
 | `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
 | `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
 | `-ElkHost`              | No            | saved value  | Elasticsearch and Kibana host, or the SSH target host if using `-UseSshTunnel`. Works the same whether it's a remote VPS or a lab machine on your local network. Also updates the saved value. |
 | `-ElasticPort`          | No            | `9200`       | Local port EvtxRelay connects to for Elasticsearch. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-BatchSize`            | No            | `2000`       | Rows sent per bulk request. |
-| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column), `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself), or `-Tool iis` (always the combined `date`+`time` columns). |
+| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. With `-Tool json`, pass a dotted path (e.g. `transaction.time_stamp`) to point at a nested field. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column), `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself), or `-Tool iis` (always the combined `date`+`time` columns). |
 | `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS or lab certificates. Turned on automatically when `-UseSshTunnel` is used. |
 | `-ResetCredential`      | No            | off          | Asks for your credentials again, for example after a password change. |
 | `-UseSshTunnel`         | No            | off (saved)  | Opens or reuses a background SSH tunnel to reach an Elasticsearch or Kibana that only listens on the VPS's own localhost. |
