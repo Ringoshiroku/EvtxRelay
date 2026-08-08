@@ -111,7 +111,7 @@
     .\EvtxRelay.ps1 -File .\waf-logs.json -Tool json
 
     for a json-based log source (aws waf, modsecurity json audit log, an xdr
-    platform export like crowdstrike fdr) -- one json object per line, or a
+    platform export like crowdstrike fdr), one json object per line, or a
     single object/array in the whole file. nested objects and arrays are kept
     nested instead of being flattened, and a timestamp field is found by
     checking a curated list of common key names at every nesting level. pass

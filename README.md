@@ -366,7 +366,7 @@ in the folder except compressed ones (`.gz`/`.zip`/`.bz2`, skipped rather than
 decompressed) lands in one shared index, tagged with `source_file` per
 record. As with those tools, folder mode is for a batch of *same-kind* files
 (several days of the same export, for example) -- a folder mixing genuinely
-different JSON shapes will still upload, but only the first file's detected
+different JSON shapes will still upload, but only the last file's detected
 timestamp field name is used as the shared index's time field.
 
 ### APT-Hunter is different: a folder of CSVs, not one file
