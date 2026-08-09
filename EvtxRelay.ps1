@@ -131,7 +131,11 @@ param(
     [Parameter(Position = 0)]
     [string]$File,
 
-    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log', 'iis', 'json')]
+    # 'detected' isn't a real choice here, it's the stand-in name a heterogeneous -folder run (no
+    # -tool, no -sametool, a genuine mix of formats) assigns to itself internally for the shared
+    # index name; validateset enforces on every assignment to $tool, not just the initial one from
+    # the command line, so it has to be listed here too or that internal assignment throws
+    [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log', 'iis', 'json', 'detected')]
     [string]$Tool,
 
     [string]$Folder,
@@ -1518,6 +1522,7 @@ function Resolve-EvtxRelayLogStructure {
         [Parameter(Mandatory)][string]$File,
         [Parameter(Mandatory)][string]$ElasticBaseUri,
         [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [string]$TimestampFieldName = '@timestamp',
         [switch]$SkipCertificateCheck,
         [Parameter(Mandatory)][string]$LogPath
     )
@@ -1734,6 +1739,25 @@ function Resolve-EvtxRelayLogStructure {
         if (-not $hasDate) {
             Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Elasticsearch's suggested pipeline has no usable timestamp step for this file; every line will be indexed as a raw message with no timestamp."
             return $null
+        }
+    }
+
+    # every date processor writes to elasticsearch's own default field ('@timestamp') unless told
+    # otherwise. a caller normalizing timestamps across several different tools onto one shared
+    # field (heterogeneous -folder detection, see the tool-auto-detection design spec) passes a
+    # different name here; every other caller uses the default and gets today's unchanged behavior.
+    # $proc.date is a plain hashtable for the kv tier's own hand-built processor above, but a
+    # pscustomobject (deserialized from elasticsearch's response) for the trusted/untrusted-pattern
+    # tiers, so setting a genuinely new property needs different syntax for each
+    foreach ($proc in $keptProcessors) {
+        $procType = @($proc.PSObject.Properties.Name)[0]
+        if ($procType -eq 'date') {
+            if ($proc.date -is [System.Collections.IDictionary]) {
+                $proc.date['target_field'] = $TimestampFieldName
+            }
+            else {
+                $proc.date | Add-Member -NotePropertyName 'target_field' -NotePropertyValue $TimestampFieldName -Force
+            }
         }
     }
 
@@ -2540,6 +2564,57 @@ function Invoke-EvtxRelayJsonBatchUpload {
 # FOLDER BATCH SUPPORT (-TOOL AUTO / -TOOL LOG / -TOOL IIS)
 
 
+# runs one heterogeneous-folder-detection csv file that resolve-evtxrelaytoolfromcontent already
+# matched to a known tool (hayabusa/chainsaw/evtxecmd) through that tool's own known timestamp
+# column/format, same as the single-file csv dispatch does for an explicit -tool hayabusa/chainsaw/
+# evtxecmd. the one difference: whichever column holds the timestamp gets renamed to
+# 'event_timestamp' in the returned headermap, so every file in a mixed folder ends up on the same
+# shared field name regardless of which tool actually produced it (tool-auto-detection design
+# spec §3)
+function Resolve-EvtxRelayKnownCsvFileDetection {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $records = @(Import-Csv -LiteralPath $File -Encoding UTF8)
+    if ($records.Count -eq 0) {
+        throw "No data rows found in '$File'."
+    }
+
+    $originalHeaders = @($records[0].PSObject.Properties.Name)
+    $headerMap = Get-SanitizedHeaderMap -Headers $originalHeaders
+    $sanitizedFields = @($headerMap.Values)
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Detected $($sanitizedFields.Count) columns: $($sanitizedFields -join ', ')"
+
+    $resolvedTimestampField = Resolve-EvtxRelayTimestampField -SanitizedFields $sanitizedFields `
+        -Candidates $TimestampCandidates[$Tool] -Override $null
+    $timestampFormat = $null
+    if ($resolvedTimestampField) {
+        $originalTimestampColumn = @($headerMap.Keys | Where-Object { $headerMap[$_] -eq $resolvedTimestampField })[0]
+        $headerMap[$originalTimestampColumn] = 'event_timestamp'
+        $sanitizedFields = @($headerMap.Values)
+        $resolvedTimestampField = 'event_timestamp'
+        $timestampFormat = $TimestampFormats[$Tool]
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Using '$originalTimestampColumn' (renamed to 'event_timestamp') as the timestamp field for sorting."
+    }
+    else {
+        Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not find a '$Tool' timestamp column in '$File'; its rows will not be time-sorted."
+    }
+
+    if ($sanitizedFields -contains 'source_file') {
+        throw "Column 'source_file' collides with the field folder mode adds automatically to tag each row's source file. Rename the source column before re-running with -Folder."
+    }
+
+    return [PSCustomObject]@{
+        HeaderMap       = $headerMap
+        SanitizedFields = $sanitizedFields
+        TimestampField  = $resolvedTimestampField
+        TimestampFormat = $timestampFormat
+    }
+}
+
 # runs one -tool auto csv file through the same detection a single-file run would do (header
 # sanitizing, field-alias concept mapping, structure-finder fallback, per-file date format
 # detection), without touching the index or uploading anything. folder mode calls this once per
@@ -2852,15 +2927,60 @@ try {
             $detected = Resolve-EvtxRelayToolFromContent -File $firstFile -LogPath $LogPath
             $Tool = $detected.Tool
             Write-EvtxRelayLog -LogPath $LogPath -Message "Detected -Tool $Tool from '$firstFile' ($($detected.Reason)); applying it to every file in '$Folder' (-SameTool)."
+            if ($Tool -in @('hayabusa', 'chainsaw', 'evtxecmd')) {
+                # these three never had -folder support of their own (only apt-hunter/auto/log/iis/
+                # json do), so falling through to the dispatch below would hit its own "-folder is
+                # only used with..." rejection. the heterogeneous engine -folder (no -sametool) uses
+                # already handles all three correctly, so -sametool reuses it here too, at the cost
+                # of it re-sniffing every file on its own instead of only trusting the first file
+                $IsHeterogeneousFolderRun = $true
+            }
         }
         else {
-            throw "Detecting a mix of formats across a folder isn't supported yet without -SameTool; pass -SameTool if every file in '$Folder' is the same kind, or -Tool to force one interpretation."
+            if ($TimestampField) {
+                throw "-TimestampField isn't supported without -Tool or -SameTool; a single column/path can't apply across a folder's mixed formats. Pass -SameTool if every file in '$Folder' is the same kind, or -Tool to force one interpretation."
+            }
+            if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+                throw "Folder not found: '$Folder'"
+            }
+
+            # detect every file independently before deciding the index name, so a folder where
+            # every file happens to agree on one tool still gets that tool's normal index name
+            # (get-evtxrelayindexname below), and only a genuinely mixed folder falls back to the
+            # 'detected' stand-in (tool-auto-detection design spec §5)
+            $excludedExtensions = @('.gz', '.zip', '.bz2')
+            $heterogeneousPaths = @(Get-ChildItem -LiteralPath $Folder -File | Where-Object { $excludedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Sort-Object Name | Select-Object -ExpandProperty FullName)
+            if ($heterogeneousPaths.Count -eq 0) {
+                throw "No usable files found in '$Folder' (compressed files like .gz/.zip/.bz2 are skipped, not decompressed)."
+            }
+            $detectedTools = New-Object System.Collections.Generic.List[string]
+            foreach ($path in $heterogeneousPaths) {
+                $detected = Resolve-EvtxRelayToolFromContent -File $path -LogPath $LogPath
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Detected -Tool $($detected.Tool) for '$path' ($($detected.Reason))."
+                if (-not $detectedTools.Contains($detected.Tool)) { $detectedTools.Add($detected.Tool) }
+            }
+            if ($detectedTools.Count -eq 1) {
+                $Tool = $detectedTools[0]
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Every file in '$Folder' detected as -Tool $Tool; using its normal index name."
+            }
+            else {
+                $Tool = 'detected'
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Files in '$Folder' detected as a mix of tools ($($detectedTools -join ', ')); uploading them together into one shared index."
+            }
+            $IsHeterogeneousFolderRun = $true
         }
     }
 
     if ($Tool -ne 'apt-hunter') { $IndexName = Get-EvtxRelayIndexName -Tool $Tool -SubModule 'events' -CustomName $IndexName -Exact:$ExactIndexName }
 
-    if ($Tool -eq 'apt-hunter') {
+    if ($IsHeterogeneousFolderRun) {
+        # already fully validated above (folder exists, -timestampfield rejected when it should
+        # be): the detected tool here can be 'hayabusa'/'chainsaw'/'evtxecmd' or the 'detected'
+        # stand-in, neither of which is in the apt-hunter/auto/log/iis/json list the branches
+        # below allow -folder for, so this has to skip that check entirely instead of tripping
+        # the 'else' branch's "-folder is only used with..." rejection
+    }
+    elseif ($Tool -eq 'apt-hunter') {
         if ($File) {
             throw "-File isn't used with -Tool apt-hunter; pass -Folder pointing at the APT-Hunter output directory instead."
         }
@@ -2935,7 +3055,212 @@ try {
     $elasticBaseUri = "https://${connectHost}:$ElasticPort"
     $kibanaBaseUri = "https://${connectHost}:$KibanaPort"
 
-    if ($Tool -eq 'apt-hunter') {
+    if ($IsHeterogeneousFolderRun) {
+        $excludedExtensions = @('.gz', '.zip', '.bz2')
+        $allPaths = @(Get-ChildItem -LiteralPath $Folder -File | Where-Object { $excludedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Sort-Object Name | Select-Object -ExpandProperty FullName)
+        if ($allPaths.Count -eq 0) {
+            throw "No usable files found in '$Folder' (compressed files like .gz/.zip/.bz2 are skipped, not decompressed)."
+        }
+
+        # detect every file up front, before creating the index, same two-pass pattern -tool auto
+        # -folder already uses, so the shared index's mappings cover every file's fields, not just
+        # the first file's. every kind's own timestamp gets normalized to 'event_timestamp' here
+        # (tool-auto-detection design spec §3), so a mixed folder still has one consistent time
+        # field for kibana to sort the whole index on
+        $detections = @{}
+        $primaryFormats = New-Object System.Collections.Generic.List[string]
+        $sharedTimestampField = $null
+        $sharedFieldTypeMappings = @{}
+        foreach ($path in $allPaths) {
+            $fileTool = (Resolve-EvtxRelayToolFromContent -File $path -LogPath $LogPath).Tool
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Detecting '$path' (-Tool $fileTool) ---"
+            $thisFileHasTimestamp = $false
+            try {
+                if ($fileTool -in @('hayabusa', 'chainsaw', 'evtxecmd')) {
+                    $detection = Resolve-EvtxRelayKnownCsvFileDetection -File $path -Tool $fileTool -LogPath $LogPath
+                    $detections[$path] = [PSCustomObject]@{ Kind = 'csv'; Tool = $fileTool; Detection = $detection }
+                    $thisFileHasTimestamp = [bool]$detection.TimestampField
+                    if ($detection.TimestampFormat) {
+                        $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
+                        if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                    }
+                    foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $detection.SanitizedFields)) {
+                        $sharedFieldTypeMappings[$ipField] = 'ip'
+                    }
+                }
+                elseif ($fileTool -eq 'auto') {
+                    $aliasMap = Get-EvtxRelayFieldAliasMap -ConfigDir $ConfigDir -LogPath $LogPath
+                    $detection = Resolve-EvtxRelayCsvFileDetection -File $path -AliasMap $aliasMap `
+                        -AutoTimestampFormatCandidates $AutoTimestampFormatCandidates -Override $null `
+                        -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                        -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                    $detections[$path] = [PSCustomObject]@{ Kind = 'csv'; Tool = $fileTool; Detection = $detection }
+                    $thisFileHasTimestamp = [bool]$detection.TimestampField
+                    if ($detection.TimestampFormat) {
+                        $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
+                        if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                    }
+                    foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $detection.SanitizedFields)) {
+                        $sharedFieldTypeMappings[$ipField] = 'ip'
+                    }
+                }
+                elseif ($fileTool -eq 'iis') {
+                    $parsed = ConvertFrom-EvtxRelayIisLogFile -File $path -LogPath $LogPath
+                    $detection = Resolve-EvtxRelayIisFileDetection -Parsed $parsed -File $path -LogPath $LogPath
+                    $detections[$path] = [PSCustomObject]@{ Kind = 'csv'; Tool = $fileTool; Detection = $detection }
+                    $thisFileHasTimestamp = [bool]$detection.TimestampField
+                    foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $detection.SanitizedFields)) {
+                        $sharedFieldTypeMappings[$ipField] = 'ip'
+                    }
+                }
+                elseif ($fileTool -eq 'json') {
+                    $detection = Resolve-EvtxRelayJsonFileDetection -File $path -Override $null -LogPath $LogPath
+                    $detections[$path] = [PSCustomObject]@{ Kind = 'json'; Tool = $fileTool; Detection = $detection }
+                    $thisFileHasTimestamp = [bool]$detection.TimestampField
+                    if ($detection.TimestampFormat) {
+                        $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
+                        if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                    }
+                    foreach ($ipPath in $detection.IpLikePaths) { $sharedFieldTypeMappings[$ipPath] = 'ip' }
+                }
+                else {
+                    # log: no fixed column list to detect ahead of time, just whether this file has a
+                    # usable per-line timestamp pattern at all. renamed onto 'event_timestamp' here too
+                    # (resolve-evtxrelaylogstructure's -timestampfieldname), same as every other kind
+                    $structureResult = Resolve-EvtxRelayLogStructure -File $path -TimestampFieldName 'event_timestamp' `
+                        -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                        -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                    $detections[$path] = [PSCustomObject]@{ Kind = 'log'; Tool = $fileTool; Detection = $structureResult }
+                    $thisFileHasTimestamp = [bool]$structureResult
+                    if ($structureResult) {
+                        foreach ($ipField in $structureResult.FieldTypeMappings.Keys) {
+                            $sharedFieldTypeMappings[$ipField] = $structureResult.FieldTypeMappings[$ipField]
+                        }
+                    }
+                }
+                if ($thisFileHasTimestamp) { $sharedTimestampField = 'event_timestamp' }
+            }
+            catch {
+                if ($_.Exception.Message -like "No data rows found in *" -or $_.Exception.Message -like "No usable JSON objects found in *") {
+                    Write-EvtxRelayLog -LogPath $LogPath -Message "Skipped '$path': no data rows."
+                    $detections[$path] = 'EMPTY'
+                    continue
+                }
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Could not detect '$path': $msg"
+                $detections[$path] = $null
+            }
+        }
+
+        $unionedFormat = $null
+        if ($primaryFormats.Count -gt 0) {
+            $unionedFormat = ($primaryFormats -join '||') + '||strict_date_optional_time||epoch_millis'
+        }
+        elseif ($sharedTimestampField) {
+            # every file that contributed a timestamp was a -tool log file (log never adds to
+            # $primaryFormats, since its date processor already normalizes the value server-side);
+            # the index still needs a format string, so fall back to the same fixed constant
+            # -tool log always uses
+            $unionedFormat = 'strict_date_optional_time||epoch_millis'
+        }
+
+        $indexSetup = Resolve-EvtxRelayBatchIndexSetup -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+            -Tool $Tool -IndexName $IndexName -Exact:$ExactIndexName `
+            -TimestampField $sharedTimestampField -TimestampFormat $unionedFormat `
+            -FieldTypeMappings $sharedFieldTypeMappings `
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+        $IndexName = $indexSetup.IndexName
+
+        $fileResults = New-Object System.Collections.Generic.List[object]
+        foreach ($path in $allPaths) {
+            $sourceFile = Split-Path -Leaf $path
+            $entry = $detections[$path]
+            if ($entry -eq 'EMPTY') {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Skipped (empty)' })
+                continue
+            }
+            if (-not $entry) {
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+                continue
+            }
+            Write-EvtxRelayLog -LogPath $LogPath -Message "--- Uploading '$path' (-Tool $($entry.Tool)) ---"
+            try {
+                if ($entry.Kind -eq 'csv') {
+                    if ($entry.Tool -eq 'iis') {
+                        $parsed = ConvertFrom-EvtxRelayIisLogFile -File $path -LogPath $LogPath
+                        $records = $parsed.Records
+                    }
+                    else {
+                        $records = @(Import-Csv -LiteralPath $path -Encoding UTF8)
+                    }
+                    $uploadResult = Invoke-EvtxRelayCsvBatchUpload -Records $records -HeaderMap $entry.Detection.HeaderMap `
+                        -SanitizedFields $entry.Detection.SanitizedFields -SourceFile $sourceFile -IndexName $IndexName `
+                        -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                        -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                    $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalRows })
+                }
+                elseif ($entry.Kind -eq 'json') {
+                    if ($entry.Detection.TimestampField) {
+                        foreach ($r in $entry.Detection.Records) {
+                            $r['event_timestamp'] = Get-EvtxRelayJsonValueAtPath -Value $r -Path $entry.Detection.TimestampField
+                        }
+                    }
+                    $uploadResult = Invoke-EvtxRelayJsonBatchUpload -Records $entry.Detection.Records -SourceFile $sourceFile -IndexName $IndexName `
+                        -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                        -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                    $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalRecords })
+                }
+                else {
+                    $lines = @(Get-Content -LiteralPath $path -Encoding UTF8)
+                    $uploadResult = Invoke-EvtxRelayLogBatchUpload -Lines $lines -SourceFile $sourceFile -IndexName $IndexName `
+                        -StructureResult $entry.Detection -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders -BatchSize $BatchSize `
+                        -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
+                    $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Uploaded'; RowsIndexed = $uploadResult.RowsIndexed; TotalRows = $uploadResult.TotalLines })
+                }
+            }
+            catch {
+                $detail = $_.ErrorDetails.Message
+                $msg = if ($detail) { "$($_.Exception.Message): $detail" } else { $_.Exception.Message }
+                Write-EvtxRelayLog -LogPath $LogPath -Level ERROR -Message "Failed '$path': $msg"
+                $fileResults.Add([PSCustomObject]@{ File = $sourceFile; Status = 'Failed' })
+            }
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
+        $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
+        $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
+            -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
+            -SkipCertificateCheck:$effectiveSkipCertCheck
+
+        $ignoredCount = $null
+        if ($sharedFieldTypeMappings.Count -gt 0) {
+            $ignoredCount = Get-EvtxRelayIgnoredFieldCount -ElasticBaseUri $elasticBaseUri -AuthHeaders $authHeaders `
+                -IndexName $IndexName -SkipCertificateCheck:$effectiveSkipCertCheck
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== Batch summary ==='
+        foreach ($r in $fileResults) {
+            $line = "$($r.File): $($r.Status)"
+            if ($r.Status -eq 'Uploaded') { $line += " ($($r.RowsIndexed)/$($r.TotalRows) rows into '$IndexName')" }
+            Write-EvtxRelayLog -LogPath $LogPath -Message $line
+        }
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana Data View:    $(if ($dataView.Created) { 'created' } else { 'already existed' })"
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana saved search: $(if ($savedSearch.Created) { 'created' } else { 'already existed' })"
+        if ($null -ne $ignoredCount) {
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Ip values ignored:   $ignoredCount row(s) in '$IndexName' (valid but stored, not searchable on that column)"
+        }
+
+        $failedCount = @($fileResults | Where-Object { $_.Status -eq 'Failed' }).Count
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay done ==='
+        if ($failedCount -gt 0) {
+            throw "$failedCount of $($fileResults.Count) file(s) failed. See the batch summary above."
+        }
+    }
+    elseif ($Tool -eq 'apt-hunter') {
         $csvPaths = @(Get-ChildItem -LiteralPath $Folder -Filter '*.csv' -File | Select-Object -ExpandProperty FullName)
         if ($csvPaths.Count -eq 0) {
             throw "No .csv files found in '$Folder'."
