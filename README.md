@@ -50,21 +50,61 @@ Get-Help .\EvtxRelay.ps1 -Examples  # just the usage examples
 
 ## Basic usage
 
-Run the parser tool yourself first, then hand its CSV output to EvtxRelay
-and tell it which schema to expect with `-Tool`:
+Run the parser tool yourself first, then hand its CSV output to EvtxRelay.
+`-Tool` is optional — EvtxRelay looks at the file itself and figures out
+which tool produced it — but you can still pass it explicitly if you'd
+rather be exact about it, or if a guess turns out wrong:
 
 ```powershell
-.\EvtxRelay.ps1 -File .\crownjewel2.csv -Tool hayabusa
+.\EvtxRelay.ps1 -File .\crownjewel2.csv
 .\EvtxRelay.ps1 -File .\path.csv -Tool chainsaw
 .\EvtxRelay.ps1 -File .\htb-trojan-system.csv -Tool evtxecmd
 .\EvtxRelay.ps1 -Folder .\apt-hunter-output -Tool apt-hunter
-.\EvtxRelay.ps1 -File .\unknown-tool-output.csv -Tool auto
+.\EvtxRelay.ps1 -File .\unknown-tool-output.csv
 ```
 
-`-Tool` accepts `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, or `auto`.
-Other than `auto`, it is never guessed from the CSV headers, since each
-tool's schema can change across versions and being explicit is safer than
-guessing.
+`-Tool` accepts `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`,
+`log`, `iis`, or `json`. apt-hunter output is never auto-detected (its
+folder layout is too different from every other tool's to guess safely),
+so `-Tool apt-hunter` always has to be passed by hand; every other tool is
+detected from the file's own content when `-Tool` is left out. See
+"Automatic tool detection" below for how it decides, and for `-Folder`'s
+detection behavior specifically.
+
+### Automatic tool detection
+
+Leaving `-Tool` out entirely tells EvtxRelay to look at the file and
+decide for itself, in this order: a JSON value → `json`; a `#Fields:`
+line → `iis`; a CSV header containing a column that uniquely identifies
+hayabusa (`RuleTitle`), chainsaw (`detections`), or evtxecmd
+(`EventRecordId`/`RecordNumber`) → that tool; any other CSV-shaped header
+→ `auto`; anything else → `log`. Every decision is logged (`.evtxrelay\
+evtxrelay.log`), so it's never a silent guess — if it picks wrong, pass
+`-Tool` explicitly to override it.
+
+`-Folder` without `-Tool` detects every file in the folder independently.
+They still all land in one shared index (tagged with `source_file`, same
+as every other folder mode): if every file happens to detect as the same
+tool, that tool's normal index name is used (`hayabusa-events`, and so
+on); if the folder turns out to be a genuine mix of formats, they share a
+`detected-events`-style index instead, and every document's timestamp
+(whatever field/column it originally came from) is normalized onto a
+common `event_timestamp` field so Kibana can still time-sort the whole
+index regardless of which tool produced which document.
+
+If you already know a folder is one consistent kind of file, `-SameTool`
+skips per-file detection and only sniffs the first one, applying its
+result to the rest — functionally the same as passing `-Tool` yourself,
+without having to know or type the tool's name:
+
+```powershell
+.\EvtxRelay.ps1 -Folder .\exports -SameTool
+```
+
+apt-hunter output is never auto-detected, in `-File` or `-Folder`, with or
+without `-SameTool` — its folder layout (one index per category, instead
+of one shared index) is too different from every other tool's to guess
+safely. Always pass `-Tool apt-hunter` by hand for it.
 
 ### `-Tool auto`: for a CSV from a tool EvtxRelay doesn't know about
 
@@ -558,8 +598,9 @@ your lab certificate is self-signed:
 | Parameter              | Required     | Default      | Purpose |
 |------------------------|---------------|--------------|---------|
 | `-File`                 | If not apt-hunter | none    | Path to the CSV produced by the parser. Not used with `-Tool apt-hunter`; use `-Folder` instead. |
-| `-Tool`                 | Yes           | none         | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, `log`, `iis`, or `json`. Picks the target index and the timestamp field guess. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. `iis` is for IIS W3C Extended web server logs. `json` is for JSON-based log sources (NDJSON, one JSON object per line); nested objects/arrays are kept nested, not flattened. |
-| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`), `-Tool log`, `-Tool iis`, or `-Tool json` (every file except `.gz`/`.zip`/`.bz2` for the latter three); for those four, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd`. |
+| `-Tool`                 | No            | auto-detected | `hayabusa`, `chainsaw`, `evtxecmd`, `apt-hunter`, `auto`, `log`, `iis`, or `json`. Picks the target index and the timestamp field guess. Optional (except for apt-hunter output, which is never auto-detected) — leaving it out looks at the file's own content instead; see "Automatic tool detection" above. `auto` also renames matching columns using `.evtxrelay\field-aliases.json`. `log` is for plain `.log` files instead of CSVs. `iis` is for IIS W3C Extended web server logs. `json` is for JSON-based log sources (NDJSON, one JSON object per line); nested objects/arrays are kept nested, not flattened. |
+| `-Folder`               | No            | none         | Path to a folder of files to upload instead of a single `-File`. Required with `-Tool apt-hunter` (every `.csv` in the folder gets its own index). Optional with `-Tool auto` (every `.csv`), `-Tool log`, `-Tool iis`, or `-Tool json` (every file except `.gz`/`.zip`/`.bz2` for the latter three); for those four, every file in the folder lands in one shared index instead of its own, tagged with a `source_file` field per row. Not supported with `-Tool hayabusa`/`chainsaw`/`evtxecmd` explicitly, but reachable through them without `-Tool` at all (see "Automatic tool detection" above and `-SameTool` below). |
+| `-SameTool`              | No            | off          | Only with `-Folder` and no `-Tool`. Detects just the first file in the folder and applies that result to every file, instead of detecting each one independently. |
 | `-IndexName`            | No            | none         | Adds a custom prefix to the Elasticsearch index (and matching Kibana Data View/saved search) name, in front of the default `hayabusa-events`/`chainsaw-events`/`evtxecmd-events` naming, e.g. `case42-hayabusa-events`. With `-Tool apt-hunter`, it prefixes each category's index the same way: `<IndexName>-apt-hunter-<category>` (for example `case42-apt-hunter-logon_events`), instead of the default `apt-hunter-<category>`. |
 | `-ExactIndexName`       | No            | off          | Requires `-IndexName`. Uses that name as-is for the index instead of adding the tool name in, e.g. `-IndexName case42` becomes just `case42` rather than `case42-hayabusa-events`. With `-Tool apt-hunter`, the category is still appended (`case42-logon_events`), since categories can't share one index. |
 | `-ElkHost`              | No            | saved value  | Elasticsearch and Kibana host, or the SSH target host if using `-UseSshTunnel`. Works the same whether it's a remote VPS or a lab machine on your local network. Also updates the saved value. |

@@ -26,6 +26,18 @@
     each document so you can still tell which file a given row or line came
     from.
 
+    -Tool itself is optional. leave it out and the script looks at the file's
+    own content to figure out which of hayabusa/chainsaw/evtxecmd/auto/log/iis/
+    json it is, the same way you'd recognize it yourself. this works for -File
+    and for -Folder. for -Folder specifically, without -Tool every file gets
+    detected on its own and they still all land in one shared index (a folder
+    that turns out to be a genuine mix of formats gets a shared "detected"
+    index name instead of one named after a single tool); pass -SameTool
+    instead if you already know every file in the folder is the same kind, so
+    only the first file needs sniffing. apt-hunter is never auto-detected,
+    since its folder layout (one index per category) is too different from
+    every other tool's to guess safely; always pass -Tool apt-hunter by hand.
+
     kibana changed how data views are managed between versions, so this
     script tries the newer way first and automatically falls back to the
     older way if that fails.
@@ -125,6 +137,31 @@
     export. every file is detected independently, but they all land in one
     shared index instead of one each, with a source_file field on every
     record so you can still tell which file a given record came from.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -File .\crownjewel2.csv
+
+    for any of the file-shaped tools above, -Tool can just be left out. the
+    script looks at the file itself and figures out which one it is (in this
+    case, hayabusa, from its RuleTitle column) the same way you would.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\exports
+
+    for a folder, without -Tool, every file gets detected on its own. they
+    still all land in one shared index either way: if every file happens to
+    detect as the same tool, that tool's normal index name is used; if the
+    folder turns out to be a genuine mix of formats, they share a
+    "detected"-named index instead. not for apt-hunter output, which always
+    needs -Tool apt-hunter passed by hand (see above).
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Folder .\exports -SameTool
+
+    for a folder you already know is one consistent kind of file. only the
+    first file gets sniffed, and whatever it detects as gets applied to
+    every file in the folder, without you having to know or type the tool's
+    name yourself.
 #>
 [CmdletBinding()]
 param(
