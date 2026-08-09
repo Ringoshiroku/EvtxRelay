@@ -131,11 +131,11 @@ param(
     [Parameter(Position = 0)]
     [string]$File,
 
-    [Parameter(Mandatory)]
     [ValidateSet('hayabusa', 'chainsaw', 'evtxecmd', 'apt-hunter', 'auto', 'log', 'iis', 'json')]
     [string]$Tool,
 
     [string]$Folder,
+    [switch]$SameTool,
     [string]$IndexName,
     [switch]$ExactIndexName,
     [string]$ElkHost,
@@ -199,6 +199,92 @@ function Get-EvtxRelayIndexName {
 }
 
 
+# TOOL DETECTION
+
+
+# a csv column name that, if present, reliably identifies which of the three known event-log
+# tools produced the file, checked case-insensitively against the sanitized header. chainsaw and
+# evtxecmd both happen to use a timestamp column named like hayabusa's own ('timestamp'/
+# 'Timestamp'), so the signature has to be a column none of the others use, not the timestamp
+# column itself
+$CsvSignatureColumns = [ordered]@{
+    hayabusa = @('RuleTitle')
+    chainsaw = @('detections')
+    evtxecmd = @('EventRecordId', 'RecordNumber')
+}
+
+# reads a small prefix of a file (never the whole thing) and guesses which -tool value it belongs
+# to, for when -tool is omitted. order matters: json and iis both have a cheap, distinctive marker
+# checked first; csv needs its header line checked against the three known tools' signature
+# columns above; anything left over is -tool log, which never fails to match since it accepts
+# arbitrary text
+function Resolve-EvtxRelayToolFromContent {
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $sampleLines = @(Get-Content -LiteralPath $File -TotalCount 20 -Encoding UTF8)
+    $firstNonBlankLine = @($sampleLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+
+    # json: a real json source here is always a top-level object or array (see the json-log-
+    # support design spec), so a first non-whitespace character that isn't '{' or '[' rules json
+    # out without even attempting a parse
+    if ($firstNonBlankLine.Count -gt 0 -and $firstNonBlankLine[0].TrimStart()[0] -in @('{', '[')) {
+        $looksLikeJson = $false
+        try {
+            $firstNonBlankLine[0] | ConvertFrom-Json -ErrorAction Stop | Out-Null
+            $looksLikeJson = $true
+        }
+        catch {
+            # not a complete value on its own; a pretty-printed single object/array (e.g. just '{'
+            # alone on the first line) still might parse as one whole value, tried next
+        }
+        if (-not $looksLikeJson) {
+            try {
+                (Get-Content -LiteralPath $File -Raw -Encoding UTF8) | ConvertFrom-Json -ErrorAction Stop | Out-Null
+                $looksLikeJson = $true
+            }
+            catch {
+                $looksLikeJson = $false
+            }
+        }
+        if ($looksLikeJson) {
+            return [PSCustomObject]@{ Tool = 'json'; Reason = "'$File' starts with a JSON value" }
+        }
+    }
+
+    # iis: the real header lives on a '#fields:' line, not necessarily row 1
+    if (@($sampleLines | Where-Object { $_ -match '^#Fields:' }).Count -gt 0) {
+        return [PSCustomObject]@{ Tool = 'iis'; Reason = "'$File' has a '#Fields:' line" }
+    }
+
+    # csv: a header-line-only check, not a full import-csv. the real parse happens once a tool is
+    # actually chosen (every caller of this function re-parses regardless), so detection itself
+    # never adds a third full-file parse on top of that
+    if ($sampleLines.Count -gt 0) {
+        # a quoted header column (e.g. "RuleTitle") still has its quotes after the split, so they're
+        # trimmed off here. without this, a quoted signature column never matches below
+        $headerCandidates = @($sampleLines[0] -split ',' | ForEach-Object { $_.Trim('"') })
+        if ($headerCandidates.Count -gt 1) {
+            $headerMap = Get-SanitizedHeaderMap -Headers $headerCandidates
+            $sanitizedHeader = @($headerMap.Values)
+            foreach ($knownTool in $CsvSignatureColumns.Keys) {
+                foreach ($signatureColumn in $CsvSignatureColumns[$knownTool]) {
+                    if ($sanitizedHeader -icontains $signatureColumn) {
+                        return [PSCustomObject]@{ Tool = $knownTool; Reason = "'$File' has a column named '$signatureColumn'" }
+                    }
+                }
+            }
+            return [PSCustomObject]@{ Tool = 'auto'; Reason = "'$File' looks like CSV but its header doesn't match a known tool's signature column" }
+        }
+    }
+
+    # nothing else matched; -tool log accepts any text, so it's the catch-all
+    return [PSCustomObject]@{ Tool = 'log'; Reason = "'$File' didn't match json, iis, or a csv-shaped header" }
+}
+
+
 # SETUP
 
 
@@ -209,7 +295,6 @@ if (-not (Test-Path -LiteralPath $ConfigDir)) {
 $LogPath = Join-Path $ConfigDir 'evtxrelay.log'
 $ElkHostPlaceholder = '<ISI_IP_ATAU_HOSTNAME_ELK_DI_SINI>'
 if (-not $IndexName -and $ExactIndexName) { throw '-ExactIndexName requires -IndexName to be given as well.' }
-if ($Tool -ne 'apt-hunter') { $IndexName = Get-EvtxRelayIndexName -Tool $Tool -SubModule 'events' -CustomName $IndexName -Exact:$ExactIndexName }
 
 # best guess at which column holds the date/time for each tool, used only if
 # -timestampfield isn't given by hand. apt-hunter names this column
@@ -2729,6 +2814,52 @@ function Invoke-EvtxRelayLogBatchUpload {
 Write-EvtxRelayLog -LogPath $LogPath -Message "=== EvtxRelay start: File='$File' Tool='$Tool' ==="
 
 try {
+    # true only for a default (no -tool, no -sametool) -folder run once task 2 implements it;
+    # task 1 always leaves this false, since that specific combination still throws below
+    $IsHeterogeneousFolderRun = $false
+
+    if ($SameTool -and -not $Folder) {
+        throw '-SameTool only applies to -Folder; a single -File has nothing to be "the same" as.'
+    }
+    if ($SameTool -and $Tool) {
+        throw '-SameTool has no effect when -Tool is given explicitly; omit one or the other.'
+    }
+
+    if (-not $Tool) {
+        if (-not $File -and -not $Folder) {
+            throw '-File or -Folder is required.'
+        }
+        if ($File -and $Folder) {
+            throw '-File and -Folder cannot both be given; pass one or the other.'
+        }
+
+        if ($File) {
+            if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
+                throw "File not found: '$File'"
+            }
+            $detected = Resolve-EvtxRelayToolFromContent -File $File -LogPath $LogPath
+            $Tool = $detected.Tool
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Detected -Tool $Tool ($($detected.Reason))."
+        }
+        elseif ($SameTool) {
+            if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+                throw "Folder not found: '$Folder'"
+            }
+            $firstFile = Get-ChildItem -LiteralPath $Folder -File | Sort-Object Name | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $firstFile) {
+                throw "No files found in '$Folder'."
+            }
+            $detected = Resolve-EvtxRelayToolFromContent -File $firstFile -LogPath $LogPath
+            $Tool = $detected.Tool
+            Write-EvtxRelayLog -LogPath $LogPath -Message "Detected -Tool $Tool from '$firstFile' ($($detected.Reason)); applying it to every file in '$Folder' (-SameTool)."
+        }
+        else {
+            throw "Detecting a mix of formats across a folder isn't supported yet without -SameTool; pass -SameTool if every file in '$Folder' is the same kind, or -Tool to force one interpretation."
+        }
+    }
+
+    if ($Tool -ne 'apt-hunter') { $IndexName = Get-EvtxRelayIndexName -Tool $Tool -SubModule 'events' -CustomName $IndexName -Exact:$ExactIndexName }
+
     if ($Tool -eq 'apt-hunter') {
         if ($File) {
             throw "-File isn't used with -Tool apt-hunter; pass -Folder pointing at the APT-Hunter output directory instead."
