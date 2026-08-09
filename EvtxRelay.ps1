@@ -34,7 +34,11 @@
     that turns out to be a genuine mix of formats gets a shared "detected"
     index name instead of one named after a single tool); pass -SameTool
     instead if you already know every file in the folder is the same kind, so
-    only the first file needs sniffing. apt-hunter is never auto-detected,
+    only the first file needs sniffing. the exception is when that first file
+    detects as hayabusa/chainsaw/evtxecmd: those three still get every file
+    detected independently under the hood (cheap, and harmless as long as the
+    folder really is one consistent kind), so "only the first file" is only
+    literally true for auto/log/iis/json. apt-hunter is never auto-detected,
     since its folder layout (one index per category) is too different from
     every other tool's to guess safely; always pass -Tool apt-hunter by hand.
 
@@ -161,7 +165,10 @@
     for a folder you already know is one consistent kind of file. only the
     first file gets sniffed, and whatever it detects as gets applied to
     every file in the folder, without you having to know or type the tool's
-    name yourself.
+    name yourself. exception: if the first file detects as hayabusa,
+    chainsaw, or evtxecmd, every file still gets sniffed independently under
+    the hood, since those three never had their own -folder support to fall
+    back on.
 #>
 [CmdletBinding()]
 param(
@@ -2926,8 +2933,8 @@ function Invoke-EvtxRelayLogBatchUpload {
 Write-EvtxRelayLog -LogPath $LogPath -Message "=== EvtxRelay start: File='$File' Tool='$Tool' ==="
 
 try {
-    # true only for a default (no -tool, no -sametool) -folder run once task 2 implements it;
-    # task 1 always leaves this false, since that specific combination still throws below
+    # true only for a default -folder run (no -tool, no -sametool), which detects every file on
+    # its own instead of using a single tool's dispatch
     $IsHeterogeneousFolderRun = $false
 
     if ($SameTool -and -not $Folder) {
@@ -2957,9 +2964,10 @@ try {
             if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
                 throw "Folder not found: '$Folder'"
             }
-            $firstFile = Get-ChildItem -LiteralPath $Folder -File | Sort-Object Name | Select-Object -First 1 -ExpandProperty FullName
+            $excludedExtensions = @('.gz', '.zip', '.bz2')
+            $firstFile = Get-ChildItem -LiteralPath $Folder -File | Where-Object { $excludedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Sort-Object Name | Select-Object -First 1 -ExpandProperty FullName
             if (-not $firstFile) {
-                throw "No files found in '$Folder'."
+                throw "No usable files found in '$Folder' (compressed files like .gz/.zip/.bz2 are skipped, not decompressed)."
             }
             $detected = Resolve-EvtxRelayToolFromContent -File $firstFile -LogPath $LogPath
             $Tool = $detected.Tool
@@ -2970,6 +2978,9 @@ try {
                 # only used with..." rejection. the heterogeneous engine -folder (no -sametool) uses
                 # already handles all three correctly, so -sametool reuses it here too, at the cost
                 # of it re-sniffing every file on its own instead of only trusting the first file
+                if ($TimestampField) {
+                    throw "-TimestampField isn't supported with -SameTool when the detected tool doesn't have its own -Folder support (hayabusa/chainsaw/evtxecmd); pass -Tool explicitly instead."
+                }
                 $IsHeterogeneousFolderRun = $true
             }
         }
@@ -3146,6 +3157,10 @@ try {
                     $detection = Resolve-EvtxRelayIisFileDetection -Parsed $parsed -File $path -LogPath $LogPath
                     $detections[$path] = [PSCustomObject]@{ Kind = 'csv'; Tool = $fileTool; Detection = $detection }
                     $thisFileHasTimestamp = [bool]$detection.TimestampField
+                    if ($detection.TimestampFormat) {
+                        $primaryFormat = $detection.TimestampFormat -replace '\|\|strict_date_optional_time\|\|epoch_millis$', ''
+                        if (-not $primaryFormats.Contains($primaryFormat)) { $primaryFormats.Add($primaryFormat) }
+                    }
                     foreach ($ipField in (Get-EvtxRelayIpLikeFields -FieldNames $detection.SanitizedFields)) {
                         $sharedFieldTypeMappings[$ipField] = 'ip'
                     }
