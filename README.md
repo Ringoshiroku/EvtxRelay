@@ -84,13 +84,16 @@ evtxrelay.log`), so it's never a silent guess — if it picks wrong, pass
 
 `-Folder` without `-Tool` detects every file in the folder independently.
 They still all land in one shared index (tagged with `source_file`, same
-as every other folder mode): if every file happens to detect as the same
-tool, that tool's normal index name is used (`hayabusa-events`, and so
-on); if the folder turns out to be a genuine mix of formats, they share a
-`detected-events`-style index instead, and every document's timestamp
-(whatever field/column it originally came from) is normalized onto a
-common `event_timestamp` field so Kibana can still time-sort the whole
-index regardless of which tool produced which document.
+as every other folder mode), and this happens unconditionally, not just
+when the folder turns out to be a genuine mix: every document's timestamp
+(whatever field/column it originally came from) is always normalized onto
+a common `event_timestamp` field, so Kibana can time-sort the whole index
+regardless of which tool produced which document. This is true even if
+every file happens to detect as the same tool, in which case the index
+still gets that tool's normal name (`hayabusa-events`, and so on), just
+with `event_timestamp` instead of that tool's own native timestamp field
+name. If the folder turns out to be a genuine mix of formats, they share a
+`detected-events`-style index instead.
 
 If you already know a folder is one consistent kind of file, `-SameTool`
 skips per-file detection and only sniffs the first one, applying its
@@ -100,6 +103,15 @@ without having to know or type the tool's name:
 ```powershell
 .\EvtxRelay.ps1 -Folder .\exports -SameTool
 ```
+
+The exception is when the first file detects as `hayabusa`, `chainsaw`, or
+`evtxecmd`: those three never had their own `-Folder` support, so
+`-SameTool` routes them through the same per-file detection used when
+`-Tool` is left out entirely, meaning every file still gets sniffed on its
+own instead of only the first one. This is cheap and harmless as long as
+the folder really is one consistent kind, but it does mean `-SameTool`
+isn't a literal "only the first file is sniffed" guarantee for those three
+tools. `auto`, `log`, `iis`, and `json` keep the true sniff-once behavior.
 
 apt-hunter output is never auto-detected, in `-File` or `-Folder`, with or
 without `-SameTool` — its folder layout (one index per category, instead
@@ -607,7 +619,7 @@ your lab certificate is self-signed:
 | `-ElasticPort`          | No            | `9200`       | Local port EvtxRelay connects to for Elasticsearch. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-KibanaPort`           | No            | `5601`       | Local port EvtxRelay connects to for Kibana. This is the tunnel's local port if using `-UseSshTunnel`. |
 | `-BatchSize`            | No            | `2000`       | Rows sent per bulk request. |
-| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. With `-Tool json`, pass a dotted path (e.g. `transaction.time_stamp`) to point at a nested field. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column), `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself), or `-Tool iis` (always the combined `date`+`time` columns). |
+| `-TimestampField`       | No            | auto-guessed | Overrides the column used to sort the Kibana saved search, if the guess is wrong or missing. With `-Tool json`, pass a dotted path (e.g. `transaction.time_stamp`) to point at a nested field. Not supported with `-Tool apt-hunter` (each category file has its own differently-named date column), `-Tool log` (the timestamp field is always `@timestamp`, found by Elasticsearch itself), `-Tool iis` (always the combined `date`+`time` columns), or a `-Folder` run with no `-Tool` and no `-SameTool` (a single column/path can't apply across a folder's mixed formats). Pass `-SameTool` if the folder is one consistent kind, or `-Tool` explicitly, instead. |
 | `-SkipCertificateCheck` | No            | off          | Skips TLS certificate checks, for self-signed VPS or lab certificates. Turned on automatically when `-UseSshTunnel` is used. |
 | `-ResetCredential`      | No            | off          | Asks for your credentials again, for example after a password change. |
 | `-UseSshTunnel`         | No            | off (saved)  | Opens or reuses a background SSH tunnel to reach an Elasticsearch or Kibana that only listens on the VPS's own localhost. |
