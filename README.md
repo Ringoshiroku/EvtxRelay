@@ -22,7 +22,7 @@ over HTTPS. See [Getting started](#getting-started) for both cases.
   instead, see [Getting started](#getting-started). Needs Windows'
   OpenSSH client (`ssh`) on your `PATH`.
 - Elastic/Kibana credentials that can write indices and create saved
-  objects.
+  objects, filled into `config.json` (see [Getting started](#getting-started)).
 - Kibana 7.x or 8.x. EvtxRelay detects whether your Kibana uses Data Views
   (8.x) or the older index pattern API (7.x) and uses the right one
   automatically.
@@ -45,12 +45,11 @@ This README stays intentionally short. Reach for `-Full` for the fine print.
    `.evtxrelay\config.json` in the current folder and stops, that run
    never touches Elasticsearch or Kibana.
 2. Open `config.json` and fill in `ElkHost` (a VPS hostname/IP or a lab
-   machine's LAN IP, both work the same). Then pick one of the two paths
-   below depending on how your ELK stack is reachable.
-3. Run the script again against a real file. The first time it needs
-   credentials, it prompts for a username and a masked password, then
-   caches them encrypted (tied to your Windows user/machine, never plain
-   text). Every run after that only needs `-File`/`-Folder` and `-Tool`.
+   machine's LAN IP, both work the same), `ElkUsername`, and `ElkPassword`.
+   Then pick one of the two paths below depending on how your ELK stack is
+   reachable.
+3. Run the script again against a real file. Every run after the first only
+   needs `-File`/`-Folder` and `-Tool`.
 
 Run the script from the same folder each time: `.evtxrelay\` lives wherever
 you ran it from, not your home folder.
@@ -144,7 +143,6 @@ timestamp handling work per tool.
 | `-BatchSize` | no | `2000` | rows per bulk request |
 | `-TimestampField` | no | auto-guessed | override the timestamp column/path, not supported for apt-hunter, `log`, `iis`, or an undetected `-Folder` mix |
 | `-SkipCertificateCheck` | no | off | skip TLS checks, for self-signed certs, on automatically with `-UseSshTunnel` |
-| `-ResetCredential` | no | off | re-prompt for Elastic/Kibana credentials |
 | `-UseSshTunnel` | no | off (saved) | open/reuse a background SSH tunnel |
 | `-SshUser` | if tunneling | saved | SSH username |
 | `-SshKeyPath` | if tunneling | saved | path to a passphrase-less SSH private key |
@@ -174,7 +172,6 @@ batch summary covering every file is printed at the end.
 
 | File | Purpose |
 |---|---|
-| `.evtxrelay\config.json` | `ElkHost` and SSH tunnel settings, fill in before your first run |
-| `.evtxrelay\credential.xml` | encrypted Elastic/Kibana credentials |
+| `.evtxrelay\config.json` | `ElkHost`, `ElkUsername`/`ElkPassword`, and SSH tunnel settings, fill in before your first run |
 | `.evtxrelay\evtxrelay.log` | a running log of every run, including detection decisions |
 | `.evtxrelay\field-aliases.json` | `-Tool auto`'s column-name-to-concept table (created on first use, editable) |
