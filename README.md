@@ -54,6 +54,12 @@ This README stays intentionally short. Reach for `-Full` for the fine print.
 Run the script from the same folder each time: `.evtxrelay\` lives wherever
 you ran it from, not your home folder.
 
+Everything you fill into `config.json`, `ElkHost`, `ElkUsername`,
+`ElkPassword`, and the SSH tunnel fields if you use them, is cached and
+reused automatically on every later run, whether you connect directly or
+through a tunnel. The one flag that's never cached, on either path, is
+`-SkipCertificateCheck`: pass it again on every run that needs it.
+
 **Direct connection**: Elasticsearch/Kibana reachable straight from your
 workstation (lab stack on the same WiFi/LAN, or a VPS with public ports):
 
@@ -62,8 +68,7 @@ workstation (lab stack on the same WiFi/LAN, or a VPS with public ports):
 ```
 
 Drop `-SkipCertificateCheck` if the host uses a certificate your machine
-already trusts. Unlike `-ElkHost`, it isn't cached, pass it on every run
-against a self-signed cert.
+already trusts.
 
 **Via SSH tunnel**: use this when `Test-NetConnection -ComputerName <host>
 -Port 9200` fails from your workstation. Elasticsearch may only be
@@ -75,16 +80,20 @@ SSH key needs no passphrase (the tunnel can't prompt for one):
     -SshUser security-engineer -SshKeyPath ~\.ssh\engineer.pem -RemoteKibanaPort 443
 ```
 
-`-UseSshTunnel`, `-SshUser`, `-SshKeyPath`, and the remote ports are all
-cached too. The tunnel is opened in the background and reused on later
-runs. It keeps running after the script exits, which is fine to leave.
-Close it yourself with `Get-Process ssh | Stop-Process` if you want to.
+`-UseSshTunnel` skips `-SkipCertificateCheck` for you automatically, since
+the tunnel connects to `localhost`, not the real host, so its certificate
+never matches anyway. The tunnel is opened in the background and reused on
+later runs. It keeps running after the script exits, which is fine to
+leave. Close it yourself with `Get-Process ssh | Stop-Process` if you want to.
 
 After either path, later runs are just:
 
 ```powershell
 .\EvtxRelay.ps1 -File .\your-next-file.csv -Tool hayabusa
 ```
+
+Add `-SkipCertificateCheck` back to that if you're on the direct-connection
+path with a self-signed certificate. The SSH tunnel path never needs it.
 
 ## Basic usage
 
