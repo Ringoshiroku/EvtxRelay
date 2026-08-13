@@ -192,7 +192,6 @@ param(
     [int]$BatchSize = 2000,
     [string]$TimestampField,
     [switch]$SkipCertificateCheck,
-    [switch]$ResetCredential,
 
     [switch]$UseSshTunnel,
     [string]$SshUser,
@@ -447,7 +446,7 @@ function Write-EvtxRelayLog {
 }
 
 
-# SETTINGS AND SAVED LOGIN
+# SETTINGS
 
 
 # creates a blank settings file for the user to fill in on first run
@@ -459,6 +458,8 @@ function New-EvtxRelayConfigTemplate {
     )
     $template = [PSCustomObject]@{
         ElkHost           = $Placeholder
+        ElkUsername       = ''
+        ElkPassword       = ''
         UseSshTunnel      = $false
         SshUser           = ''
         SshKeyPath        = ''
@@ -466,7 +467,7 @@ function New-EvtxRelayConfigTemplate {
         RemoteKibanaPort  = 443
     }
     $template | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath
-    Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Edit 'ElkHost' (and the SSH fields, if you need -UseSshTunnel) before running again."
+    Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Fill in 'ElkHost', 'ElkUsername', and 'ElkPassword' (and the SSH fields, if you need -UseSshTunnel), then run again."
 }
 
 # loads the saved settings file, mixes in any values passed on the command
@@ -483,7 +484,7 @@ function Get-EvtxRelayConfig {
 
     if (-not (Test-Path -LiteralPath $configPath)) {
         New-EvtxRelayConfigTemplate -ConfigPath $configPath -Placeholder $ElkHostPlaceholder -LogPath $LogPath
-        throw "config.json did not exist, so a template was created at '$configPath'. Fill in 'ElkHost' (and SSH fields if you use -UseSshTunnel), then run again."
+        throw "config.json did not exist, so a template was created at '$configPath'. Fill in 'ElkHost', 'ElkUsername', and 'ElkPassword' (and SSH fields if you use -UseSshTunnel), then run again."
     }
 
     try {
@@ -497,6 +498,16 @@ function Get-EvtxRelayConfig {
 
     if ([string]::IsNullOrWhiteSpace($elkHostValue) -or $elkHostValue -eq $ElkHostPlaceholder) {
         throw "No ELK host is set. Pass -ElkHost explicitly, or edit 'ElkHost' in '$configPath' (it's currently unset or still the placeholder value)."
+    }
+
+    $elkUsernameValue = if ($cached.ElkUsername) { $cached.ElkUsername } else { '' }
+    $elkPasswordValue = if ($cached.ElkPassword) { $cached.ElkPassword } else { '' }
+
+    if ([string]::IsNullOrWhiteSpace($elkUsernameValue)) {
+        throw "No Elastic/Kibana username is set. Fill in 'ElkUsername' in '$configPath'."
+    }
+    if ([string]::IsNullOrWhiteSpace($elkPasswordValue)) {
+        throw "No Elastic/Kibana password is set. Fill in 'ElkPassword' in '$configPath'."
     }
 
     $useSshTunnelValue = if ($SshOverrides.ContainsKey('UseSshTunnel')) { [bool]$SshOverrides.UseSshTunnel }
@@ -530,6 +541,8 @@ function Get-EvtxRelayConfig {
 
     $configObject = [PSCustomObject]@{
         ElkHost           = $elkHostValue
+        ElkUsername       = $elkUsernameValue
+        ElkPassword       = $elkPasswordValue
         UseSshTunnel      = $useSshTunnelValue
         SshUser           = $sshUserValue
         SshKeyPath        = $sshKeyPathValue
@@ -540,45 +553,6 @@ function Get-EvtxRelayConfig {
 
     return $configObject
 }
-
-# gets the saved login for elastic/kibana, or asks the user to type it in if
-# there isn't one saved yet (or -resetcredential was passed)
-function Get-EvtxRelayCredential {
-    param(
-        [Parameter(Mandatory)][string]$ConfigDir,
-        [switch]$Reset,
-        [Parameter(Mandatory)][string]$LogPath
-    )
-    $credPath = Join-Path $ConfigDir 'credential.xml'
-    if (-not $Reset -and (Test-Path -LiteralPath $credPath)) {
-        try {
-            $cred = Import-Clixml -LiteralPath $credPath
-            if (-not $cred -or -not $cred.UserName) {
-                throw 'cached credential file is empty or missing a username'
-            }
-            return $cred
-        }
-        catch {
-            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Could not use cached credential at '$credPath' ($($_.Exception.Message)). This usually happens if the cache was copied from a different Windows user/machine. Re-prompting for credentials."
-        }
-    }
-
-    Write-EvtxRelayLog -LogPath $LogPath -Message 'No usable cached credential found. Enter your Elastic/Kibana credentials below.'
-
-    $userName = Read-Host -Prompt 'Elastic/Kibana username'
-    if ([string]::IsNullOrWhiteSpace($userName)) {
-        throw 'No username was entered. Re-run the script to try again.'
-    }
-    $securePassword = Read-Host -Prompt 'Elastic/Kibana password' -AsSecureString
-    if ($securePassword.Length -eq 0) {
-        throw 'No password was entered. Re-run the script to try again.'
-    }
-
-    $cred = New-Object System.Management.Automation.PSCredential($userName, $securePassword)
-    $cred | Export-Clixml -LiteralPath $credPath
-    return $cred
-}
-
 
 # SSH TUNNEL
 
@@ -3082,7 +3056,8 @@ try {
     if ($PSBoundParameters.ContainsKey('RemoteKibanaPort')) { $sshOverrides.RemoteKibanaPort = $RemoteKibanaPort }
 
     $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -SshOverrides $sshOverrides -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
-    $cred = Get-EvtxRelayCredential -ConfigDir $ConfigDir -Reset:$ResetCredential -LogPath $LogPath
+    $securePassword = ConvertTo-SecureString -String $config.ElkPassword -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($config.ElkUsername, $securePassword)
 
     if ($config.UseSshTunnel) {
         Confirm-SshTunnel -ElkHost $config.ElkHost -SshUser $config.SshUser -SshKeyPath $config.SshKeyPath `
