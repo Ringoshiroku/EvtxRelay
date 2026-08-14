@@ -2911,6 +2911,17 @@ try {
     # its own instead of using a single tool's dispatch
     $IsHeterogeneousFolderRun = $false
 
+    # checked before -file/-folder so a bare first run creates config.json and stops,
+    # instead of failing on missing arguments before ever reaching this
+    $sshOverrides = @{}
+    if ($PSBoundParameters.ContainsKey('UseSshTunnel')) { $sshOverrides.UseSshTunnel = $UseSshTunnel.IsPresent }
+    if ($SshUser) { $sshOverrides.SshUser = $SshUser }
+    if ($SshKeyPath) { $sshOverrides.SshKeyPath = $SshKeyPath }
+    if ($PSBoundParameters.ContainsKey('RemoteElasticPort')) { $sshOverrides.RemoteElasticPort = $RemoteElasticPort }
+    if ($PSBoundParameters.ContainsKey('RemoteKibanaPort')) { $sshOverrides.RemoteKibanaPort = $RemoteKibanaPort }
+
+    $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -SshOverrides $sshOverrides -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
+
     if ($SameTool -and -not $Folder) {
         throw '-SameTool only applies to -Folder; a single -File has nothing to be "the same" as.'
     }
@@ -3048,14 +3059,6 @@ try {
         }
     }
 
-    $sshOverrides = @{}
-    if ($PSBoundParameters.ContainsKey('UseSshTunnel')) { $sshOverrides.UseSshTunnel = $UseSshTunnel.IsPresent }
-    if ($SshUser) { $sshOverrides.SshUser = $SshUser }
-    if ($SshKeyPath) { $sshOverrides.SshKeyPath = $SshKeyPath }
-    if ($PSBoundParameters.ContainsKey('RemoteElasticPort')) { $sshOverrides.RemoteElasticPort = $RemoteElasticPort }
-    if ($PSBoundParameters.ContainsKey('RemoteKibanaPort')) { $sshOverrides.RemoteKibanaPort = $RemoteKibanaPort }
-
-    $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -SshOverrides $sshOverrides -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
     $securePassword = ConvertTo-SecureString -String $config.ElkPassword -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential($config.ElkUsername, $securePassword)
 
