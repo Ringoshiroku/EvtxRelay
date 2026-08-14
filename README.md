@@ -148,7 +148,7 @@ timestamp handling work per tool.
 | `-ExactIndexName` | no | off | requires `-IndexName`, uses it as-is instead of adding the tool name in |
 | `-ElkHost` | no | saved | Elasticsearch/Kibana host, or the SSH target if tunneling |
 | `-ElasticPort` | no | `9200` | local port for Elasticsearch (tunnel's local port, if tunneling) |
-| `-KibanaPort` | no | `5601` | local port for Kibana (tunnel's local port, if tunneling) |
+| `-KibanaPort` | no | `5601`, but 443 is tried first if not tunneling | local port for Kibana (tunnel's local port, if tunneling) |
 | `-BatchSize` | no | `2000` | rows per bulk request |
 | `-TimestampField` | no | auto-guessed | override the timestamp column/path, not supported for apt-hunter, `log`, `iis`, or an undetected `-Folder` mix |
 | `-SkipCertificateCheck` | no | off | skip TLS checks, for self-signed certs, on automatically with `-UseSshTunnel` |
