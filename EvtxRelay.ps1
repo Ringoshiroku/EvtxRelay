@@ -3078,8 +3078,28 @@ try {
     $effectiveSkipCertCheck = [bool]($SkipCertificateCheck -or $config.UseSshTunnel)
     $connectHost = if ($config.UseSshTunnel) { '127.0.0.1' } else { $config.ElkHost }
 
+    # most lab elk stacks put kibana behind a reverse proxy on 443, not its native default of
+    # 5601, so try 443 first when the caller didn't pin a port down explicitly. skipped for ssh
+    # tunnels, since -kibanaport there is the tunnel's local port, not something to probe directly
+    $effectiveKibanaPort = $KibanaPort
+    if (-not $config.UseSshTunnel -and -not $PSBoundParameters.ContainsKey('KibanaPort')) {
+        $probe = New-Object System.Net.Sockets.TcpClient
+        try {
+            if ($probe.ConnectAsync($connectHost, 443).Wait(2000) -and $probe.Connected) {
+                $effectiveKibanaPort = 443
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana reachable on port 443; using it instead of the default $KibanaPort."
+            }
+        }
+        catch {
+            # 443 isn't reachable (refused, filtered, or timed out); fall back to the default below
+        }
+        finally {
+            $probe.Close()
+        }
+    }
+
     $elasticBaseUri = "https://${connectHost}:$ElasticPort"
-    $kibanaBaseUri = "https://${connectHost}:$KibanaPort"
+    $kibanaBaseUri = "https://${connectHost}:$effectiveKibanaPort"
 
     if ($IsHeterogeneousFolderRun) {
         $excludedExtensions = @('.gz', '.zip', '.bz2')
