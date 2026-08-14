@@ -659,6 +659,32 @@ function Invoke-ElkRequest {
     return Invoke-RestMethod @params
 }
 
+# runs a script block, retrying it a few times if the connection drops mid-request with no
+# response at all (a reset or dropped connection, seen under heavy load on some elk stacks). a
+# real http response, even an error one like 404, means the request reached the server and got
+# answered, so that's never retried. the whole block gets re-run on each attempt rather than just
+# the failed http call, since these blocks check "does this already exist" before creating
+# anything, so a retry after a silently-successful create finds it instead of making a duplicate
+function Invoke-EvtxRelayWithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string]$LogPath,
+        [int]$MaxAttempts = 4
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            if ($_.Exception.Response -or $attempt -eq $MaxAttempts) { throw }
+            $delaySeconds = [Math]::Pow(2, $attempt)
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "$Description failed ($($_.Exception.Message)); retrying in ${delaySeconds}s (attempt $attempt of $MaxAttempts)."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
 
 # CLEANING UP THE CSV
 
@@ -952,66 +978,69 @@ function Confirm-KibanaDataView {
         [Parameter(Mandatory)][hashtable]$AuthHeaders,
         [Parameter(Mandatory)][string]$IndexName,
         [string]$TimestampField,
-        [switch]$SkipCertificateCheck
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
     )
 
-    # newer kibana versions have a dedicated way to manage data views. older
-    # versions don't have it and return a plain "not found" instead, so fall
-    # back to the older method in that case.
-    $useLegacyApi = $false
-    $existing = $null
-    try {
-        $listResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views" -Method Get `
-            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
-        $existing = $listResp.data_view | Where-Object { $_.title -eq $IndexName } | Select-Object -First 1
-    }
-    catch {
-        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
-            $useLegacyApi = $true
+    return Invoke-EvtxRelayWithRetry -LogPath $LogPath -Description "Kibana Data View for '$IndexName'" -ScriptBlock {
+        # newer kibana versions have a dedicated way to manage data views. older
+        # versions don't have it and return a plain "not found" instead, so fall
+        # back to the older method in that case.
+        $useLegacyApi = $false
+        $existing = $null
+        try {
+            $listResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views" -Method Get `
+                -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+            $existing = $listResp.data_view | Where-Object { $_.title -eq $IndexName } | Select-Object -First 1
         }
-        else {
-            throw
-        }
-    }
-
-    if ($useLegacyApi) {
-        $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=index-pattern&per_page=1000" -Method Get `
-            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
-        $existingObj = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $IndexName } | Select-Object -First 1
-        if ($existingObj) {
-            return @{ Id = $existingObj.id; Created = $false }
+        catch {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+                $useLegacyApi = $true
+            }
+            else {
+                throw
+            }
         }
 
-        $legacyBody = @{ attributes = @{ title = $IndexName } }
-        if ($TimestampField) { $legacyBody.attributes.timeFieldName = $TimestampField }
+        if ($useLegacyApi) {
+            $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=index-pattern&per_page=1000" -Method Get `
+                -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+            $existingObj = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $IndexName } | Select-Object -First 1
+            if ($existingObj) {
+                return @{ Id = $existingObj.id; Created = $false }
+            }
+
+            $legacyBody = @{ attributes = @{ title = $IndexName } }
+            if ($TimestampField) { $legacyBody.attributes.timeFieldName = $TimestampField }
+
+            $createHeaders = $AuthHeaders.Clone()
+            $createHeaders['kbn-xsrf'] = 'true'
+
+            $legacyCreateResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/index-pattern" -Method Post `
+                -Headers $createHeaders -Body ($legacyBody | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
+                -SkipCertificateCheck:$SkipCertificateCheck
+
+            return @{ Id = $legacyCreateResp.id; Created = $true }
+        }
+
+        if ($existing) {
+            return @{ Id = $existing.id; Created = $false }
+        }
+
+        $body = @{ data_view = @{ title = $IndexName } }
+        if ($TimestampField) {
+            $body.data_view.timeFieldName = $TimestampField
+        }
 
         $createHeaders = $AuthHeaders.Clone()
         $createHeaders['kbn-xsrf'] = 'true'
 
-        $legacyCreateResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/index-pattern" -Method Post `
-            -Headers $createHeaders -Body ($legacyBody | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
+        $createResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views/data_view" -Method Post `
+            -Headers $createHeaders -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
             -SkipCertificateCheck:$SkipCertificateCheck
 
-        return @{ Id = $legacyCreateResp.id; Created = $true }
+        return @{ Id = $createResp.data_view.id; Created = $true }
     }
-
-    if ($existing) {
-        return @{ Id = $existing.id; Created = $false }
-    }
-
-    $body = @{ data_view = @{ title = $IndexName } }
-    if ($TimestampField) {
-        $body.data_view.timeFieldName = $TimestampField
-    }
-
-    $createHeaders = $AuthHeaders.Clone()
-    $createHeaders['kbn-xsrf'] = 'true'
-
-    $createResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views/data_view" -Method Post `
-        -Headers $createHeaders -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' `
-        -SkipCertificateCheck:$SkipCertificateCheck
-
-    return @{ Id = $createResp.data_view.id; Created = $true }
 }
 
 # makes sure a ready-to-open saved search exists in kibana for our index,
@@ -1023,60 +1052,63 @@ function Confirm-KibanaSavedSearch {
         [Parameter(Mandatory)][string]$IndexName,
         [Parameter(Mandatory)][string]$DataViewId,
         [string]$TimestampField,
-        [switch]$SkipCertificateCheck
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
     )
 
     $title = "$IndexName (EvtxRelay)"
 
-    $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=search&per_page=1000" `
-        -Method Get -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
-    $existing = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $title } | Select-Object -First 1
-    if ($existing) {
-        return @{ Id = $existing.id; Created = $false }
-    }
-
-    # sort order must be written as [direction, column name], the reverse of
-    # what you'd expect. writing it the other way causes confusing errors.
-    $sort = @()
-    if ($TimestampField) {
-        $sort = @(, @('desc', $TimestampField))
-    }
-
-    # the saved search must point at the data view using this specific
-    # linking style, matching how kibana itself saves these.
-    $searchSource = @{
-        indexRefName = 'kibanaSavedObjectMeta.searchSourceJSON.index'
-        query        = @{ query = ''; language = 'kuery' }
-        filter       = @()
-        sort         = $sort
-    }
-
-    $body = @{
-        attributes = @{
-            title                 = $title
-            sort                  = $sort
-            columns               = @('_source')
-            kibanaSavedObjectMeta = @{
-                searchSourceJSON = ($searchSource | ConvertTo-Json -Compress -Depth 5)
-            }
+    return Invoke-EvtxRelayWithRetry -LogPath $LogPath -Description "Kibana saved search for '$IndexName'" -ScriptBlock {
+        $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=search&per_page=1000" `
+            -Method Get -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+        $existing = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $title } | Select-Object -First 1
+        if ($existing) {
+            return @{ Id = $existing.id; Created = $false }
         }
-        references = @(
-            @{
-                id   = $DataViewId
-                name = 'kibanaSavedObjectMeta.searchSourceJSON.index'
-                type = 'index-pattern'
+
+        # sort order must be written as [direction, column name], the reverse of
+        # what you'd expect. writing it the other way causes confusing errors.
+        $sort = @()
+        if ($TimestampField) {
+            $sort = @(, @('desc', $TimestampField))
+        }
+
+        # the saved search must point at the data view using this specific
+        # linking style, matching how kibana itself saves these.
+        $searchSource = @{
+            indexRefName = 'kibanaSavedObjectMeta.searchSourceJSON.index'
+            query        = @{ query = ''; language = 'kuery' }
+            filter       = @()
+            sort         = $sort
+        }
+
+        $body = @{
+            attributes = @{
+                title                 = $title
+                sort                  = $sort
+                columns               = @('_source')
+                kibanaSavedObjectMeta = @{
+                    searchSourceJSON = ($searchSource | ConvertTo-Json -Compress -Depth 5)
+                }
             }
-        )
+            references = @(
+                @{
+                    id   = $DataViewId
+                    name = 'kibanaSavedObjectMeta.searchSourceJSON.index'
+                    type = 'index-pattern'
+                }
+            )
+        }
+
+        $createHeaders = $AuthHeaders.Clone()
+        $createHeaders['kbn-xsrf'] = 'true'
+
+        $createResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/search" -Method Post `
+            -Headers $createHeaders -Body ($body | ConvertTo-Json -Depth 6) -ContentType 'application/json' `
+            -SkipCertificateCheck:$SkipCertificateCheck
+
+        return @{ Id = $createResp.id; Created = $true }
     }
-
-    $createHeaders = $AuthHeaders.Clone()
-    $createHeaders['kbn-xsrf'] = 'true'
-
-    $createResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/search" -Method Post `
-        -Headers $createHeaders -Body ($body | ConvertTo-Json -Depth 6) -ContentType 'application/json' `
-        -SkipCertificateCheck:$SkipCertificateCheck
-
-    return @{ Id = $createResp.id; Created = $true }
 }
 
 
@@ -1483,12 +1515,12 @@ function Invoke-EvtxRelayFileUpload {
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
     $dataView = Confirm-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
-        -IndexName $IndexName -TimestampField $TimestampField -SkipCertificateCheck:$SkipCertificateCheck
+        -IndexName $IndexName -TimestampField $TimestampField -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
     $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $TimestampField `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     # PRINT A SUMMARY
 
@@ -1889,12 +1921,12 @@ function Invoke-EvtxRelayLogUpload {
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
     $dataView = Confirm-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
-        -IndexName $IndexName -TimestampField $timestampField -SkipCertificateCheck:$SkipCertificateCheck
+        -IndexName $IndexName -TimestampField $timestampField -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
     $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $timestampField `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     # lines the pipeline's on_failure handler tagged never get an @timestamp, so they're invisible in
     # the time-filtered saved search; surface the count here since it's the only place that shows them
@@ -2478,12 +2510,12 @@ function Invoke-EvtxRelayJsonUpload {
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
     $dataView = Confirm-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
-        -IndexName $IndexName -TimestampField $TimestampField -SkipCertificateCheck:$SkipCertificateCheck
+        -IndexName $IndexName -TimestampField $TimestampField -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
     $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
         -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $TimestampField `
-        -SkipCertificateCheck:$SkipCertificateCheck
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
 
     $ignoredCount = $null
     if ($ipFieldTypeMappings.Count -gt 0) {
@@ -3279,12 +3311,12 @@ try {
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
         $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
         $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
-            -SkipCertificateCheck:$effectiveSkipCertCheck
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         $ignoredCount = $null
         if ($sharedFieldTypeMappings.Count -gt 0) {
@@ -3464,12 +3496,12 @@ try {
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
         $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
         $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
-            -SkipCertificateCheck:$effectiveSkipCertCheck
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         # an ip-mapped column always shows up in the shared index's mapping even if every
         # value for it across every file turned out malformed, so this needs its own count
@@ -3575,12 +3607,12 @@ try {
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
         $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-            -IndexName $IndexName -TimestampField '@timestamp' -SkipCertificateCheck:$effectiveSkipCertCheck
+            -IndexName $IndexName -TimestampField '@timestamp' -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
         $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField '@timestamp' `
-            -SkipCertificateCheck:$effectiveSkipCertCheck
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         # an ip-mapped field always shows up in the shared index's mapping even if every
         # value for it across every file turned out malformed, so this needs its own count
@@ -3689,12 +3721,12 @@ try {
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
         $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
         $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
-            -SkipCertificateCheck:$effectiveSkipCertCheck
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         $ignoredCount = $null
         if ($sharedFieldTypeMappings.Count -gt 0) {
@@ -3800,12 +3832,12 @@ try {
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana Data View for '$IndexName'..."
         $dataView = Confirm-KibanaDataView -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
-            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck
+            -IndexName $IndexName -TimestampField $sharedTimestampField -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         Write-EvtxRelayLog -LogPath $LogPath -Message "Ensuring Kibana saved search for '$IndexName'..."
         $savedSearch = Confirm-KibanaSavedSearch -KibanaBaseUri $kibanaBaseUri -AuthHeaders $authHeaders `
             -IndexName $IndexName -DataViewId $dataView.Id -TimestampField $sharedTimestampField `
-            -SkipCertificateCheck:$effectiveSkipCertCheck
+            -SkipCertificateCheck:$effectiveSkipCertCheck -LogPath $LogPath
 
         $ignoredCount = $null
         if ($sharedFieldTypeMappings.Count -gt 0) {
