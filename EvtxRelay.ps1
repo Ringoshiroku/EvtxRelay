@@ -495,7 +495,9 @@ function New-EvtxRelayConfigTemplate {
         RemoteElasticPort = 9200
         RemoteKibanaPort  = 443
     }
-    $template | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath
+    $json = $template | ConvertTo-Json
+    $json = $json -replace '\\u003c', '<' -replace '\\u003e', '>'
+    $json | Set-Content -LiteralPath $ConfigPath
     Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Fill in 'ElkHost', 'ElkUsername', and 'ElkPassword' (and the SSH fields, if you need -UseSshTunnel), then run again."
 }
 
