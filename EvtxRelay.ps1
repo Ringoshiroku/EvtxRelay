@@ -478,6 +478,19 @@ function Write-EvtxRelayLog {
 # SETTINGS
 
 
+# writes an object as json, undoing ConvertTo-Json's default escaping of
+# <, >, & and ' so the file stays readable if someone opens it by hand
+function Write-EvtxRelayJson {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $json = $Object | ConvertTo-Json
+    $json = $json -replace '\\u003c', '<' -replace '\\u003e', '>' `
+        -replace '\\u0026', '&' -replace '\\u0027', "'"
+    $json | Set-Content -LiteralPath $Path
+}
+
 # creates a blank settings file for the user to fill in on first run
 function New-EvtxRelayConfigTemplate {
     param(
@@ -495,9 +508,7 @@ function New-EvtxRelayConfigTemplate {
         RemoteElasticPort = 9200
         RemoteKibanaPort  = 443
     }
-    $json = $template | ConvertTo-Json
-    $json = $json -replace '\\u003c', '<' -replace '\\u003e', '>'
-    $json | Set-Content -LiteralPath $ConfigPath
+    Write-EvtxRelayJson -Object $template -Path $ConfigPath
     Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "No config found. Created a template at '$ConfigPath'. Fill in 'ElkHost', 'ElkUsername', and 'ElkPassword' (and the SSH fields, if you need -UseSshTunnel), then run again."
 }
 
@@ -580,7 +591,7 @@ function Get-EvtxRelayConfig {
         RemoteElasticPort = $remoteElasticPortValue
         RemoteKibanaPort  = $remoteKibanaPortValue
     }
-    $configObject | ConvertTo-Json | Set-Content -LiteralPath $configPath
+    Write-EvtxRelayJson -Object $configObject -Path $configPath
 
     return $configObject
 }
@@ -1518,7 +1529,7 @@ function Get-EvtxRelayFieldAliasMap {
             event_id        = @('EventID', 'EventId', 'Event ID', 'EventCode')
             process_name    = @('ProcessName', 'Process Name', 'Image', 'NewProcessName', 'ParentProcessName')
         }
-        $defaults | ConvertTo-Json | Set-Content -LiteralPath $aliasPath
+        Write-EvtxRelayJson -Object $defaults -Path $aliasPath
         Write-EvtxRelayLog -LogPath $LogPath -Message "No field alias table found. Created one with built-in defaults at '$aliasPath'. Edit it to add or change concepts."
     }
 
