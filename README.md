@@ -157,6 +157,10 @@ timestamp handling work per tool.
 | `-SshKeyPath` | if tunneling | saved | path to a passphrase-less SSH private key |
 | `-RemoteElasticPort` | no | `9200` (saved) | Elasticsearch's port on the ELK host itself |
 | `-RemoteKibanaPort` | no | `443` (saved) | Kibana's port on the ELK host itself |
+| `-Cleanup` | no | off | enter cleanup mode, see [Cleanup](#cleanup) below |
+| `-DeleteIndex` | with `-Cleanup` | none | full index name to delete, along with its Data View and saved search |
+| `-DeleteSavedSearch` | with `-Cleanup` | none | full index name whose saved search to delete |
+| `-DeleteAll` | with `-Cleanup` | off | delete every index/Data View/saved search EvtxRelay has created |
 
 ## What each run does
 
@@ -176,6 +180,23 @@ timestamp handling work per tool.
 
 With `-Tool apt-hunter`, steps 1-5 run once per CSV in `-Folder`, and a
 batch summary covering every file is printed at the end.
+
+## Cleanup
+
+`-Cleanup`, combined with exactly one of `-DeleteIndex`, `-DeleteSavedSearch`,
+or `-DeleteAll`, removes what a previous run created:
+
+```powershell
+.\EvtxRelay.ps1 -Cleanup -DeleteIndex hayabusa-events        # index + its Data View + its saved search
+.\EvtxRelay.ps1 -Cleanup -DeleteSavedSearch hayabusa-events  # just the saved search
+.\EvtxRelay.ps1 -Cleanup -DeleteAll                           # everything EvtxRelay has ever created
+```
+
+Every saved search EvtxRelay creates is titled `<index> (EvtxRelay)`;
+`-DeleteAll` finds every saved search with that tag and, for each one,
+deletes its Data View and index too, so nothing without the tag is ever
+touched. Every cleanup action shows what it found and asks for
+confirmation before deleting anything.
 
 ## Local files
 

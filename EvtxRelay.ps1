@@ -169,6 +169,30 @@
     chainsaw, or evtxecmd, every file still gets sniffed independently under
     the hood, since those three never had their own -folder support to fall
     back on.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Cleanup -DeleteIndex hayabusa-events
+
+    deletes an index this script created, along with its kibana data view
+    and saved search, so nothing is left behind pointing at a gone index.
+    asks for confirmation first. -DeleteIndex takes the full index name, the
+    same one shown when the index was created (not the -indexname prefix on
+    its own).
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Cleanup -DeleteSavedSearch hayabusa-events
+
+    deletes just the saved search for that index, leaving the data view and
+    the index itself alone. useful if you want the saved search recreated
+    fresh on the next run.
+
+.EXAMPLE
+    .\EvtxRelay.ps1 -Cleanup -DeleteAll
+
+    finds every index, data view, and saved search this script has ever
+    created (it tags each saved search's title with "(EvtxRelay)" when
+    making it), lists all of them, and after one confirmation deletes the
+    lot. nothing without that tag is touched.
 #>
 [CmdletBinding()]
 param(
@@ -197,7 +221,12 @@ param(
     [string]$SshUser,
     [string]$SshKeyPath,
     [int]$RemoteElasticPort,
-    [int]$RemoteKibanaPort
+    [int]$RemoteKibanaPort,
+
+    [switch]$Cleanup,
+    [string]$DeleteIndex,
+    [string]$DeleteSavedSearch,
+    [switch]$DeleteAll
 )
 
 $ErrorActionPreference = 'Stop'
@@ -685,6 +714,65 @@ function Invoke-EvtxRelayWithRetry {
     }
 }
 
+# opens the ssh tunnel if configured, then works out the elasticsearch/kibana base urls and the
+# basic auth header to use for every request. shared by the normal upload flow and -cleanup mode,
+# since both need the same connection before doing anything else
+function Get-EvtxRelayConnection {
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$Config,
+        [Parameter(Mandatory)][int]$ElasticPort,
+        [Parameter(Mandatory)][int]$KibanaPort,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][bool]$KibanaPortWasExplicit,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    if ($Config.UseSshTunnel) {
+        Confirm-SshTunnel -ElkHost $Config.ElkHost -SshUser $Config.SshUser -SshKeyPath $Config.SshKeyPath `
+            -LocalElasticPort $ElasticPort -RemoteElasticPort $Config.RemoteElasticPort `
+            -LocalKibanaPort $KibanaPort -RemoteKibanaPort $Config.RemoteKibanaPort -LogPath $LogPath
+    }
+
+    $securePassword = ConvertTo-SecureString -String $Config.ElkPassword -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($Config.ElkUsername, $securePassword)
+    $pair = "$($cred.UserName):$($cred.GetNetworkCredential().Password)"
+    $basicAuth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pair))
+    $authHeaders = @{ Authorization = "Basic $basicAuth" }
+
+    # the ssh tunnel connects to this same computer instead of the server's
+    # real address, so its https certificate never matches. skip that check
+    # automatically in that case.
+    $effectiveSkipCertCheck = [bool]($SkipCertificateCheck -or $Config.UseSshTunnel)
+    $connectHost = if ($Config.UseSshTunnel) { '127.0.0.1' } else { $Config.ElkHost }
+
+    # most lab elk stacks put kibana behind a reverse proxy on 443, not its native default of
+    # 5601, so try 443 first when the caller didn't pin a port down explicitly. skipped for ssh
+    # tunnels, since -kibanaport there is the tunnel's local port, not something to probe directly
+    $effectiveKibanaPort = $KibanaPort
+    if (-not $Config.UseSshTunnel -and -not $KibanaPortWasExplicit) {
+        $probe = New-Object System.Net.Sockets.TcpClient
+        try {
+            if ($probe.ConnectAsync($connectHost, 443).Wait(2000) -and $probe.Connected) {
+                $effectiveKibanaPort = 443
+                Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana reachable on port 443; using it instead of the default $KibanaPort."
+            }
+        }
+        catch {
+            # 443 isn't reachable (refused, filtered, or timed out); fall back to the default below
+        }
+        finally {
+            $probe.Close()
+        }
+    }
+
+    return [PSCustomObject]@{
+        AuthHeaders            = $authHeaders
+        ElasticBaseUri         = "https://${connectHost}:$ElasticPort"
+        KibanaBaseUri          = "https://${connectHost}:$effectiveKibanaPort"
+        EffectiveSkipCertCheck = $effectiveSkipCertCheck
+    }
+}
+
 
 # CLEANING UP THE CSV
 
@@ -1108,6 +1196,299 @@ function Confirm-KibanaSavedSearch {
             -SkipCertificateCheck:$SkipCertificateCheck
 
         return @{ Id = $createResp.id; Created = $true }
+    }
+}
+
+
+# CLEANUP
+
+
+# looks up a kibana data view by its exact title (the index name it points at), trying the newer
+# data views api first and falling back to the older saved-objects api, the same two-step lookup
+# confirm-kibanadataview above does for create. returns $null if no data view with that title
+# exists.
+function Find-KibanaDataViewByTitle {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$Title,
+        [switch]$SkipCertificateCheck
+    )
+
+    try {
+        $listResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/data_views" -Method Get `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+        $existing = $listResp.data_view | Where-Object { $_.title -eq $Title } | Select-Object -First 1
+        if ($existing) { return @{ Id = $existing.id; Legacy = $false } }
+        return $null
+    }
+    catch {
+        if (-not ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound)) {
+            throw
+        }
+    }
+
+    $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=index-pattern&per_page=1000" -Method Get `
+        -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+    $existingObj = $findResp.saved_objects | Where-Object { $_.attributes.title -eq $Title } | Select-Object -First 1
+    if ($existingObj) { return @{ Id = $existingObj.id; Legacy = $true } }
+    return $null
+}
+
+# looks up a kibana saved search by its exact title. returns $null if none exists.
+function Find-KibanaSavedSearchByTitle {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$Title,
+        [switch]$SkipCertificateCheck
+    )
+    $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=search&per_page=1000" `
+        -Method Get -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+    return $findResp.saved_objects | Where-Object { $_.attributes.title -eq $Title } | Select-Object -First 1
+}
+
+# lists every kibana saved search this script has tagged as its own: title ending in
+# " (EvtxRelay)", the exact suffix confirm-kibanasavedsearch always appends when it creates one
+function Find-EvtxRelayTaggedSavedSearches {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [switch]$SkipCertificateCheck
+    )
+    $findResp = Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/_find?type=search&per_page=1000" `
+        -Method Get -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck
+    return @($findResp.saved_objects | Where-Object { $_.attributes.title -like '* (EvtxRelay)' })
+}
+
+# checks whether an elasticsearch index exists
+function Test-ElasticIndexExists {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$SkipCertificateCheck
+    )
+    try {
+        Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName" -Method Get `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+        return $true
+    }
+    catch {
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+            return $false
+        }
+        throw
+    }
+}
+
+# deletes a kibana data view by id, trying the newer api first and falling back to the older one
+# depending on which one it was found through. tolerates the data view already being gone.
+function Remove-KibanaDataView {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$Id,
+        [switch]$Legacy,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    $deleteHeaders = $AuthHeaders.Clone()
+    $deleteHeaders['kbn-xsrf'] = 'true'
+    $uri = if ($Legacy) { "$KibanaBaseUri/api/saved_objects/index-pattern/$Id" } else { "$KibanaBaseUri/api/data_views/data_view/$Id" }
+    try {
+        Invoke-ElkRequest -Uri $uri -Method Delete -Headers $deleteHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Data view '$Id' was already gone."
+            return
+        }
+        throw
+    }
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Deleted Kibana data view '$Id'."
+}
+
+# deletes a kibana saved search by id. tolerates it already being gone.
+function Remove-KibanaSavedSearch {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$Id,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    $deleteHeaders = $AuthHeaders.Clone()
+    $deleteHeaders['kbn-xsrf'] = 'true'
+    try {
+        Invoke-ElkRequest -Uri "$KibanaBaseUri/api/saved_objects/search/$Id" -Method Delete `
+            -Headers $deleteHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Saved search '$Id' was already gone."
+            return
+        }
+        throw
+    }
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Deleted Kibana saved search '$Id'."
+}
+
+# deletes an elasticsearch index by name. tolerates it already being gone.
+function Remove-ElasticIndex {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    try {
+        Invoke-ElkRequest -Uri "$ElasticBaseUri/$IndexName" -Method Delete `
+            -Headers $AuthHeaders -SkipCertificateCheck:$SkipCertificateCheck | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+            Write-EvtxRelayLog -LogPath $LogPath -Level WARN -Message "Index '$IndexName' was already gone."
+            return
+        }
+        throw
+    }
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Deleted Elasticsearch index '$IndexName'."
+}
+
+# full teardown for one index this script made: its saved search, its data view, and the
+# elasticsearch index itself. shows what it found before asking to confirm once, and skips
+# whichever of the three don't exist instead of failing over a partial cleanup
+function Invoke-EvtxRelayCleanupIndex {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $savedSearchTitle = "$IndexName (EvtxRelay)"
+    $savedSearch = Find-KibanaSavedSearchByTitle -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -Title $savedSearchTitle -SkipCertificateCheck:$SkipCertificateCheck
+    $dataView = Find-KibanaDataViewByTitle -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -Title $IndexName -SkipCertificateCheck:$SkipCertificateCheck
+    $indexExists = Test-ElasticIndexExists -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+        -IndexName $IndexName -SkipCertificateCheck:$SkipCertificateCheck
+
+    if (-not $savedSearch -and -not $dataView -and -not $indexExists) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "Nothing found for '$IndexName'; nothing to delete."
+        return
+    }
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Found for '$IndexName':"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "  saved search: $(if ($savedSearch) { "'$savedSearchTitle'" } else { 'not found' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "  data view:    $(if ($dataView) { "'$IndexName'" } else { 'not found' })"
+    Write-EvtxRelayLog -LogPath $LogPath -Message "  index:        $(if ($indexExists) { "'$IndexName'" } else { 'not found' })"
+
+    $answer = Read-Host -Prompt 'Delete these? (y/n)'
+    if ($answer -notmatch '^(?i)y') {
+        Write-EvtxRelayLog -LogPath $LogPath -Message 'Cleanup cancelled.'
+        return
+    }
+
+    if ($savedSearch) {
+        Remove-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders -Id $savedSearch.id `
+            -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+    }
+    if ($dataView) {
+        Remove-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders -Id $dataView.Id `
+            -Legacy:$dataView.Legacy -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+    }
+    if ($indexExists) {
+        Remove-ElasticIndex -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders -IndexName $IndexName `
+            -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+    }
+}
+
+# deletes just the saved search for an index, leaving its data view and the index itself alone
+function Invoke-EvtxRelayCleanupSavedSearch {
+    param(
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [Parameter(Mandatory)][string]$IndexName,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+    $savedSearchTitle = "$IndexName (EvtxRelay)"
+    $savedSearch = Find-KibanaSavedSearchByTitle -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -Title $savedSearchTitle -SkipCertificateCheck:$SkipCertificateCheck
+    if (-not $savedSearch) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "No saved search titled '$savedSearchTitle' found; nothing to delete."
+        return
+    }
+    $answer = Read-Host -Prompt "Delete saved search '$savedSearchTitle'? (y/n)"
+    if ($answer -notmatch '^(?i)y') {
+        Write-EvtxRelayLog -LogPath $LogPath -Message 'Cleanup cancelled.'
+        return
+    }
+    Remove-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders -Id $savedSearch.id `
+        -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+}
+
+# deletes every index, data view, and saved search this script has ever created, found through the
+# "(EvtxRelay)" tag every saved search's title gets when confirm-kibanasavedsearch creates one.
+# lists everything it found before asking once, then tears each one down the same way
+# invoke-evtxrelaycleanupindex does, skipping whichever piece of a given index is already missing
+function Invoke-EvtxRelayCleanupAll {
+    param(
+        [Parameter(Mandatory)][string]$ElasticBaseUri,
+        [Parameter(Mandatory)][string]$KibanaBaseUri,
+        [Parameter(Mandatory)][hashtable]$AuthHeaders,
+        [switch]$SkipCertificateCheck,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $taggedSearches = Find-EvtxRelayTaggedSavedSearches -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+        -SkipCertificateCheck:$SkipCertificateCheck
+    if ($taggedSearches.Count -eq 0) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "No saved searches tagged '(EvtxRelay)' found; nothing to delete."
+        return
+    }
+
+    $items = @(foreach ($search in $taggedSearches) {
+        $indexName = $search.attributes.title -replace ' \(EvtxRelay\)$', ''
+        $dataView = Find-KibanaDataViewByTitle -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders `
+            -Title $indexName -SkipCertificateCheck:$SkipCertificateCheck
+        $indexExists = Test-ElasticIndexExists -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders `
+            -IndexName $indexName -SkipCertificateCheck:$SkipCertificateCheck
+        [PSCustomObject]@{
+            IndexName   = $indexName
+            SavedSearch = $search
+            DataView    = $dataView
+            IndexExists = $indexExists
+        }
+    })
+
+    Write-EvtxRelayLog -LogPath $LogPath -Message "Found $($items.Count) index(es) tagged '(EvtxRelay)':"
+    foreach ($item in $items) {
+        Write-EvtxRelayLog -LogPath $LogPath -Message "  '$($item.IndexName)': saved search yes, data view $(if ($item.DataView) { 'yes' } else { 'no' }), index $(if ($item.IndexExists) { 'yes' } else { 'no' })"
+    }
+
+    $answer = Read-Host -Prompt "Delete all $($items.Count) of these? (y/n)"
+    if ($answer -notmatch '^(?i)y') {
+        Write-EvtxRelayLog -LogPath $LogPath -Message 'Cleanup cancelled.'
+        return
+    }
+
+    foreach ($item in $items) {
+        Remove-KibanaSavedSearch -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders -Id $item.SavedSearch.id `
+            -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+        if ($item.DataView) {
+            Remove-KibanaDataView -KibanaBaseUri $KibanaBaseUri -AuthHeaders $AuthHeaders -Id $item.DataView.Id `
+                -Legacy:$item.DataView.Legacy -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+        }
+        if ($item.IndexExists) {
+            Remove-ElasticIndex -ElasticBaseUri $ElasticBaseUri -AuthHeaders $AuthHeaders -IndexName $item.IndexName `
+                -SkipCertificateCheck:$SkipCertificateCheck -LogPath $LogPath
+        }
     }
 }
 
@@ -2954,6 +3335,39 @@ try {
 
     $config = Get-EvtxRelayConfig -ConfigDir $ConfigDir -ElkHostOverride $ElkHost -SshOverrides $sshOverrides -LogPath $LogPath -ElkHostPlaceholder $ElkHostPlaceholder
 
+    if ($Cleanup) {
+        if ($File -or $Folder -or $Tool) {
+            throw '-Cleanup cannot be combined with -File, -Folder, or -Tool; run it on its own with -DeleteIndex, -DeleteSavedSearch, or -DeleteAll.'
+        }
+        $cleanupActionCount = @($DeleteIndex, $DeleteSavedSearch | Where-Object { $_ }).Count
+        if ($DeleteAll) { $cleanupActionCount++ }
+        if ($cleanupActionCount -ne 1) {
+            throw '-Cleanup requires exactly one of -DeleteIndex <name>, -DeleteSavedSearch <name>, or -DeleteAll.'
+        }
+
+        $connection = Get-EvtxRelayConnection -Config $config -ElasticPort $ElasticPort -KibanaPort $KibanaPort `
+            -SkipCertificateCheck:$SkipCertificateCheck -KibanaPortWasExplicit ($PSBoundParameters.ContainsKey('KibanaPort')) -LogPath $LogPath
+
+        if ($DeleteIndex) {
+            Invoke-EvtxRelayCleanupIndex -ElasticBaseUri $connection.ElasticBaseUri -KibanaBaseUri $connection.KibanaBaseUri `
+                -AuthHeaders $connection.AuthHeaders -IndexName $DeleteIndex -SkipCertificateCheck:$connection.EffectiveSkipCertCheck -LogPath $LogPath
+        }
+        elseif ($DeleteSavedSearch) {
+            Invoke-EvtxRelayCleanupSavedSearch -KibanaBaseUri $connection.KibanaBaseUri -AuthHeaders $connection.AuthHeaders `
+                -IndexName $DeleteSavedSearch -SkipCertificateCheck:$connection.EffectiveSkipCertCheck -LogPath $LogPath
+        }
+        else {
+            Invoke-EvtxRelayCleanupAll -ElasticBaseUri $connection.ElasticBaseUri -KibanaBaseUri $connection.KibanaBaseUri `
+                -AuthHeaders $connection.AuthHeaders -SkipCertificateCheck:$connection.EffectiveSkipCertCheck -LogPath $LogPath
+        }
+
+        Write-EvtxRelayLog -LogPath $LogPath -Message '=== EvtxRelay cleanup finished ==='
+        return
+    }
+    if ($DeleteIndex -or $DeleteSavedSearch -or $DeleteAll) {
+        throw '-DeleteIndex, -DeleteSavedSearch, and -DeleteAll require -Cleanup.'
+    }
+
     if ($SameTool -and -not $Folder) {
         throw '-SameTool only applies to -Folder; a single -File has nothing to be "the same" as.'
     }
@@ -3091,47 +3505,12 @@ try {
         }
     }
 
-    $securePassword = ConvertTo-SecureString -String $config.ElkPassword -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential($config.ElkUsername, $securePassword)
-
-    if ($config.UseSshTunnel) {
-        Confirm-SshTunnel -ElkHost $config.ElkHost -SshUser $config.SshUser -SshKeyPath $config.SshKeyPath `
-            -LocalElasticPort $ElasticPort -RemoteElasticPort $config.RemoteElasticPort `
-            -LocalKibanaPort $KibanaPort -RemoteKibanaPort $config.RemoteKibanaPort -LogPath $LogPath
-    }
-
-    $pair = "$($cred.UserName):$($cred.GetNetworkCredential().Password)"
-    $basicAuth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pair))
-    $authHeaders = @{ Authorization = "Basic $basicAuth" }
-
-    # the ssh tunnel connects to this same computer instead of the server's
-    # real address, so its https certificate never matches. skip that check
-    # automatically in that case.
-    $effectiveSkipCertCheck = [bool]($SkipCertificateCheck -or $config.UseSshTunnel)
-    $connectHost = if ($config.UseSshTunnel) { '127.0.0.1' } else { $config.ElkHost }
-
-    # most lab elk stacks put kibana behind a reverse proxy on 443, not its native default of
-    # 5601, so try 443 first when the caller didn't pin a port down explicitly. skipped for ssh
-    # tunnels, since -kibanaport there is the tunnel's local port, not something to probe directly
-    $effectiveKibanaPort = $KibanaPort
-    if (-not $config.UseSshTunnel -and -not $PSBoundParameters.ContainsKey('KibanaPort')) {
-        $probe = New-Object System.Net.Sockets.TcpClient
-        try {
-            if ($probe.ConnectAsync($connectHost, 443).Wait(2000) -and $probe.Connected) {
-                $effectiveKibanaPort = 443
-                Write-EvtxRelayLog -LogPath $LogPath -Message "Kibana reachable on port 443; using it instead of the default $KibanaPort."
-            }
-        }
-        catch {
-            # 443 isn't reachable (refused, filtered, or timed out); fall back to the default below
-        }
-        finally {
-            $probe.Close()
-        }
-    }
-
-    $elasticBaseUri = "https://${connectHost}:$ElasticPort"
-    $kibanaBaseUri = "https://${connectHost}:$effectiveKibanaPort"
+    $connection = Get-EvtxRelayConnection -Config $config -ElasticPort $ElasticPort -KibanaPort $KibanaPort `
+        -SkipCertificateCheck:$SkipCertificateCheck -KibanaPortWasExplicit ($PSBoundParameters.ContainsKey('KibanaPort')) -LogPath $LogPath
+    $authHeaders = $connection.AuthHeaders
+    $effectiveSkipCertCheck = $connection.EffectiveSkipCertCheck
+    $elasticBaseUri = $connection.ElasticBaseUri
+    $kibanaBaseUri = $connection.KibanaBaseUri
 
     if ($IsHeterogeneousFolderRun) {
         $excludedExtensions = @('.gz', '.zip', '.bz2')
