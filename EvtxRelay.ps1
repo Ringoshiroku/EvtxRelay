@@ -446,6 +446,9 @@ $JsonTimestampKeyCandidates = @(
 # elasticsearch mapping format (used once a fit is found).
 $AutoTimestampFormatCandidates = @(
     [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-ddTHH:mm:ss.ffffffK'; EsFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX||strict_date_optional_time||epoch_millis" }
+    # splunk's own _time export shape: milliseconds, and an offset with no colon (+0800, not
+    # +08:00), which is why this needs its own entry instead of matching one of the XXX ones above
+    [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-ddTHH:mm:ss.fffK'; EsFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSZ||strict_date_optional_time||epoch_millis" }
     [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-ddTHH:mm:ssK'; EsFormat = "yyyy-MM-dd'T'HH:mm:ssXXX||strict_date_optional_time||epoch_millis" }
     [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-dd HH:mm:ss.fff K'; EsFormat = 'yyyy-MM-dd HH:mm:ss.SSS XXX||strict_date_optional_time||epoch_millis' }
     [PSCustomObject]@{ DotNetFormat = 'yyyy-MM-dd HH:mm:ss.fff'; EsFormat = 'yyyy-MM-dd HH:mm:ss.SSS||strict_date_optional_time||epoch_millis' }
@@ -1521,7 +1524,7 @@ function Get-EvtxRelayFieldAliasMap {
 
     if (-not (Test-Path -LiteralPath $aliasPath)) {
         $defaults = [ordered]@{
-            event_timestamp = @('Timestamp', 'timestamp', 'TimeCreated', 'Date and Time', 'DateTime', 'datetime', '@timestamp', 'Time')
+            event_timestamp = @('Timestamp', 'timestamp', 'TimeCreated', 'Date and Time', 'DateTime', 'datetime', '@timestamp', 'Time', '_time')
             source_ip       = @('SourceIp', 'SourceIP', 'Source IP', 'src_ip', 'srcip', 'ClientIp', 'Client IP')
             dest_ip         = @('DestinationIp', 'DestIp', 'Destination IP', 'dst_ip', 'dstip', 'TargetIp', 'Target IP')
             hostname        = @('Computer', 'ComputerName', 'Hostname', 'Host', 'Host Name', 'Machine', 'MachineName')
